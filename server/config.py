@@ -91,10 +91,14 @@ class Config:
     # How fast downlink frames are written. 1.0 = real time; tests raise it so a
     # 20-round suite does not take minutes.
     playback_speed: float = 1.0
-    # How far ahead of the device's speaker we keep the stream. Has to exceed the
-    # worst gap between TTS chunks (measured 1.24 s for the first chunk, ~150 ms
-    # after that) while staying well under the device's 1.2 s ring.
-    playback_lead: float = 0.8
+    # How far ahead of the device's speaker we keep the stream.
+    #
+    # Measured on the real link (205 ms RTT, spikes to ~900 ms): a lead of 0.45 s
+    # or more makes the pacer burst, which overruns the device's receive path --
+    # its ring then drains and playback underruns. At 0.12 s the same reply plays
+    # through 114/114 frames with zero underruns. Small lead, steady rate: the
+    # device consumes ~50-65 frames/s happily but cannot absorb bursts.
+    playback_lead: float = 0.12
     max_capture_bytes: int = 32000 * 30
 
     @classmethod

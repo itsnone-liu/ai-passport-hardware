@@ -1009,6 +1009,23 @@ class Service:
                     "looks_like_undecoded_hex": (len(key) == 64 and all(
                         c in b"0123456789abcdefABCDEF" for c in key)),
                 } for dev, key in self.cfg.devices.items()]}
+            if op == "push_frames":
+                # Bench aid: push raw PAV1 frames with no playback.start, so the
+                # device can be measured reading the socket in isolation.
+                session = self.sessions[str(req.get("device", ""))]
+                if session.audio is None:
+                    return {"ok": False, "err": "no_audio_link"}
+                n = int(req.get("frames", 100))
+                turn = int(req.get("turn_id", 7))
+                pace = float(req.get("pace_ms", 20)) / 1000.0
+                payload = bytes(req.get("frame_bytes", 640))
+                sent = 0
+                for _ in range(n):
+                    await session.audio.send_frame(pav1.KIND_PCM, turn, payload)
+                    sent += 1
+                    if pace:
+                        await asyncio.sleep(pace)
+                return {"ok": True, "pushed": sent, "turn_id": turn, "pace_ms": pace * 1000}
             if op == "metrics":
                 session = self.sessions[str(req.get("device", ""))]
                 return {"ok": True, "turns": [m.as_dict() for m in session.metrics[-5:]]}
