@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "terminal_link.h"
 #include "terminal_capture.h"
+#include "terminal_playback.h"
 #include "terminal_auth.h"
 #include "terminal_pav1.h"
 #include "terminal_net.h"
@@ -118,6 +119,7 @@ void app_main(void) {
     terminal_auth_init();    // 设备 id 与密钥：必须在第一次握手之前就绪
     terminal_pav1_init();    // 音频通道任务（等 auth 通过后才会真连）
     terminal_capture_init(); // 采集任务（按键起采 / capture.start）
+    terminal_playback_init(); // 播放任务（playback.start 后按 I2S 时钟出声）
 
     bsp_i2c_init();
     bsp_i2c_scan();

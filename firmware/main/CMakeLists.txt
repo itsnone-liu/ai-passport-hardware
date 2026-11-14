@@ -7,6 +7,7 @@ idf_component_register(
          "terminal_audio.c"
          "terminal_auth.c"
          "terminal_capture.c"
+         "terminal_playback.c"
          "terminal_pav1.c"
     INCLUDE_DIRS "."
     REQUIRES bsp

@@ -15,3 +15,7 @@ esp_err_t terminal_audio_selftest_start(int ms, int frame_ms);
 
 // 是否有自测正在跑。
 bool terminal_audio_busy(void);
+
+// 纯音：只走 代码->I2S->codec DAC->扬声器，不经过麦克风。
+// 回环自测听不见时分不清是喇叭坏了还是麦克风没采到，这条能一刀切开。
+esp_err_t terminal_audio_tone_start(int ms, int hz);

@@ -17,6 +17,7 @@
 #include "terminal_auth.h"
 #include "terminal_pav1.h"
 #include "terminal_capture.h"
+#include "terminal_playback.h"
 #include "terminal_ui.h"
 
 #include <stdarg.h>
@@ -393,8 +394,10 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         }
     } else if (strcmp(c, "get_audio") == 0) {
         char audio[224];
+        char play[256];
         terminal_capture_get_audio(audio, sizeof audio);
-        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"get_audio\",%s}\n", id, audio);
+        terminal_playback_describe(play, sizeof play);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"get_audio\",%s,%s}\n", id, audio, play);
     } else if (strcmp(c, "state.set") == 0) {
         const cJSON *st = cJSON_GetObjectItemCaseSensitive(root, "state");
         static const char *k_states[] = {"idle", "listening", "processing", "speaking", "error"};
@@ -412,6 +415,50 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
             }
             reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"state.set\",\"state\":\"%s\"}\n", id,
                       st->valuestring);
+        }
+    } else if (strcmp(c, "playback.start") == 0) {
+        const uint32_t turn = (uint32_t)int_field(root, "turn_id", 0);
+        const esp_err_t err = terminal_playback_start(turn);
+        if (err == ESP_OK) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"playback.start\",\"turn_id\":%u}\n", id,
+                      (unsigned)turn);
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"playback.start\",\"err\":\"busy\"}\n", id);
+        }
+    } else if (strcmp(c, "playback.stop") == 0) {
+        const uint32_t turn = (uint32_t)int_field(root, "turn_id", 0);
+        const esp_err_t err = terminal_playback_stop(turn);
+        if (err == ESP_OK) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"playback.stop\",\"turn_id\":%u}\n", id,
+                      (unsigned)turn);
+        } else if (err == ESP_ERR_INVALID_ARG) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"playback.stop\",\"err\":\"turn_mismatch\"}\n",
+                      id);
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"playback.stop\",\"err\":\"turn_closed\"}\n",
+                      id);
+        }
+    } else if (strcmp(c, "vendor.playback_selftest") == 0) {
+        // 走真环/真任务/真 I2S，只是不经过网络：先把播放状态机验干净再接入对端。
+        const int ms = int_field(root, "ms", 2000);
+        const esp_err_t err = terminal_playback_selftest(ms);
+        if (err == ESP_OK) {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.playback_selftest\",\"ms\":%d}\n", id, ms);
+        } else {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.playback_selftest\",\"err\":\"busy\"}\n", id);
+        }
+    } else if (strcmp(c, "vendor.play_tone") == 0) {
+        const int ms = int_field(root, "ms", 1500);
+        const int hz = int_field(root, "hz", 1000);
+        const esp_err_t err = terminal_audio_tone_start(ms, hz);
+        if (err == ESP_OK) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.play_tone\",\"hz\":%d,\"ms\":%d}\n",
+                      id, hz, ms);
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.play_tone\",\"err\":\"busy\"}\n",
+                      id);
         }
     } else if (strcmp(c, "vendor.capture_arm") == 0) {
         // 厂商扩展：按键起采的等价入口，用来在没有人在设备旁边时验证 pre-roll。

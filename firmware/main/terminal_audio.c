@@ -12,6 +12,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "terminal_link.h"
+#include "terminal_ui.h"
+#include <math.h>
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -168,3 +170,52 @@ esp_err_t terminal_audio_selftest_start(int ms, int frame_ms) {
 }
 
 bool terminal_audio_busy(void) { return s_busy; }
+
+// 纯音测试：只走"代码 → I2S → codec DAC → 扬声器"，不经过麦克风。
+// 回环自测听不见时分不清是喇叭坏了还是麦克风没采到，这条能一刀切开。
+static void tone_task(void *arg) {
+    // ARG_PACK(ms, x) 把 ms 放低 16 位、x 放高 16 位，解码必须按同一约定。
+    const int ms = (int)((intptr_t)arg & 0xffff);
+    const int hz = (int)(((intptr_t)arg >> 16) & 0xffff);
+    const int amp = 8000;
+    const size_t frame_bytes = 640;  // 20 ms
+    int16_t buf[frame_bytes / 2];
+    bsp_audio_set_format(SAMPLE_HZ, 16, 1);
+    const int frames = ms / 20;
+    double phase = 0.0;
+    const double step = 2.0 * M_PI * (double)hz / (double)SAMPLE_HZ;
+    int write_fail = 0;
+    const int64_t t0 = esp_timer_get_time();
+    for (int i = 0; i < frames; i++) {
+        for (size_t j = 0; j < frame_bytes / 2; j++) {
+            buf[j] = (int16_t)(sin(phase) * (double)amp);
+            phase += step;
+            if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+        }
+        if (bsp_audio_write(buf, frame_bytes) != ESP_OK) write_fail++;
+    }
+    const int elapsed = (int)((esp_timer_get_time() - t0) / 1000);
+    ESP_LOGI(TAG, "纯音: %d Hz %d ms 用 %d ms，write_fail=%d，volume=%d", hz, ms, elapsed, write_fail,
+             terminal_ui_volume());
+    char ev[192];
+    snprintf(ev, sizeof ev,
+             "{\"event\":\"play_tone\",\"ok\":%s,\"hz\":%d,\"ms\":%d,\"elapsed_ms\":%d,\"amp\":%d,"
+             "\"volume\":%d,\"write_fail\":%d}\n",
+             write_fail == 0 ? "true" : "false", hz, ms, elapsed, amp, terminal_ui_volume(),
+             write_fail);
+    terminal_link_send_src(LINK_SRC_USB, ev);
+    s_busy = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t terminal_audio_tone_start(int ms, int hz) {
+    if (s_busy) return ESP_ERR_INVALID_STATE;
+    if (ms <= 0 || ms > 5000 || hz < 100 || hz > 8000) return ESP_ERR_INVALID_ARG;
+    s_busy = true;
+    if (xTaskCreate(tone_task, "dsh_tone", 4096, (void *)(intptr_t)ARG_PACK(ms, hz), 4, NULL) !=
+        pdPASS) {
+        s_busy = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}

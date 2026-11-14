@@ -3,6 +3,7 @@
 
 #include "terminal_auth.h"
 #include "terminal_link.h"
+#include "terminal_playback.h"
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -404,10 +405,12 @@ static void serve_frame(void *ctx, pav1_kind_t kind, uint32_t turn_id, const uin
     if (kind == PAV1_K_PCM) {
         s_rx_frames++;
         s_rx_bytes += (uint32_t)n;
-        // W2-5：这里接播放环形缓冲。当前先只计数，保证帧边界被正确切出来。
+        // 收到的每一帧都交给播放环：轮次对不对、缓冲满不满由它判定并计数。
+        terminal_playback_push(turn_id, payload, n);
     } else if (kind == PAV1_K_END) {
         s_rx_end++;
         ESP_LOGI(TAG, "收到 END turn=%u", (unsigned)turn_id);
+        terminal_playback_mark_end(turn_id);  // 环里剩的放完再收轮
     } else {
         ESP_LOGW(TAG, "运行期收到非音频帧 kind=%d turn=%u", (int)kind, (unsigned)turn_id);
     }
