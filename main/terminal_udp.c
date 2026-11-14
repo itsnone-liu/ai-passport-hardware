@@ -142,7 +142,7 @@ static uint32_t s_late, s_reorder, s_gap;
 static uint8_t s_fec_blk[FEC_GROUP][ADPCM_BLOCK_BYTES];
 static uint32_t s_fec_seq[FEC_GROUP];
 static bool s_fec_used[FEC_GROUP];
-static uint32_t s_parity, s_recovered, s_norecover;
+static uint32_t s_parity, s_recovered, s_norecover, s_staleturn;
 static uint32_t s_fec_turn;
 
 // 收到的音频块顺手存进组缓冲，等奇偶块来判丢。
@@ -207,9 +207,21 @@ static void drain_in_order(void) {
 }
 
 static void win_push(uint32_t turn, uint32_t seq, const uint8_t *blk) {
-    if (!s_down_started || turn != s_down_turn) {
-        // 换轮：上一轮压着的块一律作废，别把上一句话的尾巴接到这一句上。
+    if (!s_down_started) {
         s_down_started = true;
+        s_down_turn = turn;
+        s_down_expected = seq;
+        win_clear();
+    } else if (turn != s_down_turn) {
+        // turn_id 必须单调递增。原先遇到"不是当前轮"就无条件重置，于是一段
+        // 录制下来的旧轮次原样重放仍会被当成新的一轮接受——MAC 覆盖了 turn，
+        // 攻击者改不了它，但可以照原样再放一遍。
+        // 只在"更大"时换轮，更小的一律按重放丢掉；通道重启（重新打洞）时
+        // s_down_started 会被清掉，服务端 turn 从 1 重新数也不会被误杀。
+        if ((int32_t)(turn - s_down_turn) < 0) {
+            s_staleturn++;
+            return;
+        }
         s_down_turn = turn;
         s_down_expected = seq;
         win_clear();
@@ -394,11 +406,12 @@ int terminal_udp_diag(char *buf, size_t n) {
     return snprintf(buf, n,
              "\"udp_ready\":%s,\"udp_sent\":%u,\"udp_fail\":%u,\"udp_ack\":%u,"
              "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_badmac\":%u,\"udp_late\":%u,"
-             "\"udp_reorder\":%u,\"udp_gap\":%u,\"udp_parity\":%u,\"udp_recovered\":%u,\"udp_norecover\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
+             "\"udp_reorder\":%u,\"udp_gap\":%u,\"udp_parity\":%u,\"udp_recovered\":%u,\"udp_norecover\":%u,\"udp_staleturn\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
              terminal_udp_ready() ? "true" : "false", (unsigned)s_sent, (unsigned)s_fail,
              (unsigned)s_acks, (unsigned)s_hello, (unsigned)s_down, (unsigned)s_bad,
              (unsigned)s_badmac,
              (unsigned)s_late, (unsigned)s_reorder, (unsigned)s_gap, (unsigned)s_parity,
-             (unsigned)s_recovered, (unsigned)s_norecover, s_slow ? "true" : "false",
+             (unsigned)s_recovered, (unsigned)s_norecover, (unsigned)s_staleturn,
+             s_slow ? "true" : "false",
              s_last_errno, (long long)s_ack_ms);
 }
