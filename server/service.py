@@ -61,6 +61,12 @@ def tune_socket(writer: asyncio.StreamWriter) -> None:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
+# 合成粒度：攒到句末标点或这么多字再请求 TTS。
+# 太小 → 请求次数多、每次都吃固定开销，播放端 starving；
+# 太大 → 首句出声变慢。48 字约等于 4~6 秒音频。
+TTS_FLUSH_CHARS = 48
+TTS_SENTENCE_END = "。！？!?…；;\n"
+
 class ProtocolViolation(Exception):
     def __init__(self, code: str, detail: str = "", fatal: bool = True):
         super().__init__(f"{code}: {detail}" if detail else code)
@@ -910,6 +916,16 @@ class Session:
         producer_done = object()
 
         async def produce() -> None:
+            buf = ""
+
+            async def flush(text: str) -> None:
+                if not text.strip():
+                    return
+                async for audio in self.service.tts.stream(text):
+                    if self._cancel.is_set():
+                        return
+                    await queue.put(audio)
+
             try:
                 log.info("%s speak: asking brain for turn %d", self.device_id, turn_id)
                 async for chunk in self.service.brain.ask(m.text,
@@ -918,10 +934,21 @@ class Session:
                         m.dsh_first_ms = self.service.now_ms()
                         log.info("%s speak: first text chunk at +%d ms", self.device_id,
                                  m.dsh_first_ms - m.speech_end_ms)
-                    async for audio in self.service.tts.stream(chunk):
-                        if self._cancel.is_set():
-                            return
-                        await queue.put(audio)
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    # 按句合成：逐 delta 送 TTS 时每块只覆盖几百毫秒音频，
+                    # 而一次请求的固定开销就要 0.5 s 量级，播放端于是反复
+                    # starving（实测 6 次、531~691 ms，ahead 掉到 -1.76 s）。
+                    last = buf.rstrip()[-1:]
+                    if len(buf) < TTS_FLUSH_CHARS and last not in TTS_SENTENCE_END:
+                        continue
+                    text, buf = buf, ""
+                    await flush(text)
+                    if self._cancel.is_set():
+                        return
+                if buf.strip():
+                    await flush(buf)
             except Exception as exc:                       # noqa: BLE001
                 log.exception("synthesis failed")
                 await queue.put(exc)

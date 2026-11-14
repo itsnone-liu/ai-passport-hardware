@@ -41,6 +41,10 @@ class BailianTTS:
         self.url = f"{base_url.rstrip('/')}/api/v1/services/audio/tts/SpeechSynthesizer"
 
     async def astream(self, text: str) -> AsyncIterator[bytes]:
+        # 空文本不消耗一次请求：TTS 接口对空白串返回 400，
+        # 而调用方（流式 LLM 分块）很容易送来空白块。
+        if not text or not text.strip():  # text is blank
+            return
         body = {
             "model": self.model,
             "input": {"text": text, "voice": self.voice},

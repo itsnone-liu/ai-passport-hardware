@@ -199,3 +199,38 @@ first downlink frame turn=1 len=640 via udp
 - `play_underruns=1`：TCP 时是 0，切 UDP 后出现一次。怀疑是开头
   prebuffer 差一点（`playback_lead=0.12s`），需要按发生位置确认。
 - 上行仍无 FEC（实测 `lost=0`，暂未暴露）。
+
+## §7 回放停顿：按句合成
+
+真人第二句（"过一会儿我们要回家了。"）识别正确、回答也正确，但用户听完说
+"停顿不正确"。日志给出了确定的根因，不是网络：
+
+```
+downlink starved 531 ms waiting for TTS
+downlink starved 563 ms … 627 ms … 562 ms … 691 ms … 598 ms
+downlink: sent=1.76s ahead=-0.25s → sent=6.38s ahead=-1.76s
+```
+
+**TTS 供给跟不上播放**，六次、每次 0.5~0.7 s。原因是每收到一个 LLM delta
+就单独发一次 TTS 请求，而单次请求的固定开销（建连 + 首包）就在 0.5 s 量级，
+短块摊不平。
+
+改成攒到句末标点（`。！？!?…；;`）或 48 字再合成：
+
+| 指标 | 修前 | 修后 |
+|---|---|---|
+| `starved` 次数 | 6 | **0** |
+| `ahead` | -0.25 → **-1.76 s** | 稳定 **+0.37 s** |
+| 一段 10.9 s 音频 | 卡 6 次 | 545 帧全送达、全播放 |
+
+`playback_lead` 同时从 0.12 s 提到 0.35 s（挡不住 0.5 s 量级抖动，
+代价是首字晚 0.23 s）。
+
+### 另一个被这条链带出来的 bug
+
+更早一次回放里出现过 `synthesis failed: bailian TTS HTTP 400
+InvalidParameter: Please ensure input text is valid.`，随后设备报
+`audio_underrun`。真因是 **LLM 流里的纯空白 chunk 被直接喂给 TTS**。
+修法两处：服务端跳过空白 chunk；TTS 侧对空文本直接返回不消耗请求。
+
+这也修正了此前"`underruns=1` 可能是 prebuffer 差一点"的猜测——不是。
