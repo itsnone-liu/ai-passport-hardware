@@ -16,9 +16,9 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.dirname(HERE))          # server/
+sys.path.insert(0, ROOT)
 
-import pav1  # noqa: E402
+from server import pav1  # noqa: E402
 
 VECTORS = os.path.join(ROOT, "protocol", "v1", "vectors.json")
 

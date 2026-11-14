@@ -27,3 +27,6 @@ Thumbs.db
 # voice service secrets (Ubuntu side): per-device shared secrets, never committed
 server/config/devices/
 *.secret
+
+# local service config (holds real device secrets)
+server/config/local.json

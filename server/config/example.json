@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to server/config/local.json (git-ignored) and fill in real values. Secrets may be 'file:/path' instead of inline strings.",
+  "host": "0.0.0.0",
+  "control_port": 18080,
+  "audio_port": 18081,
+  "devices": {
+    "psp-00a1b2": {"secret": "file:server/config/devices/psp-00a1b2.secret"}
+  },
+  "asr": "bailian",
+  "tts": "bailian",
+  "brain": "mock",
+  "bailian_base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com",
+  "bailian_asr_model": "qwen-audio-3.0-realtime-plus",
+  "bailian_tts_model": "qwen-audio-3.0-tts-plus",
+  "bailian_voice": "longanlingxin",
+  "playback_speed": 1.0,
+  "dsh_url": "",
+  "dsh_session": "passport"
+}
