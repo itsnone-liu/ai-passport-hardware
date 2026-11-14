@@ -107,6 +107,7 @@ static void tick_cb(void *arg) {
 void app_main(void) {
     ESP_LOGI(TAG, "dsh terminal 启动");
     terminal_link_init();
+    terminal_net_preload();  // 配置先于 USB 通道就绪，避免开机瞬间 get_net 答空值
 
     bsp_i2c_init();
     bsp_i2c_scan();

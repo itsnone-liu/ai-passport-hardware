@@ -13,6 +13,10 @@
 
 esp_err_t terminal_net_start(void);
 
+// 只把 NVS 里的网络参数读进内存（初始化 NVS，不碰 Wi-Fi）。必须在 USB 通道开始受理
+// 命令之前调用，否则开机瞬间的 get_net 会答出一串空字段。
+void terminal_net_preload(void);
+
 // TCP 是否已连上服务器（UI 用它决定显示 USB 还是 NET）。
 bool terminal_net_ready(void);
 

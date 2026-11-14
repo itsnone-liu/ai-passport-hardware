@@ -35,6 +35,8 @@ static int s_sock = -1;
 static volatile bool s_connected;
 static volatile bool s_ip_ready;
 static volatile bool s_scanning;  // 扫描期间抑制自动重连，否则状态机抢不到扫描权
+static bool s_cfg_loaded;         // NVS 里的网络参数是否已读进内存
+static bool s_wifi_started;       // esp_wifi_start() 是否已执行
 static SemaphoreHandle_t s_tx_lock;
 static char s_line[LINE_MAX];
 static size_t s_line_len;
@@ -272,8 +274,8 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t event_id
     }
 }
 
-esp_err_t terminal_net_start(void) {
-    s_tx_lock = xSemaphoreCreateMutex();
+void terminal_net_preload(void) {
+    if (s_cfg_loaded) return;
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -282,9 +284,17 @@ esp_err_t terminal_net_start(void) {
     }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "NVS 初始化失败(%s)", esp_err_to_name(err));
-    } else {
-        config_load();
+        return;
     }
+    config_load();
+    s_cfg_loaded = true;
+}
+
+esp_err_t terminal_net_start(void) {
+    s_tx_lock = xSemaphoreCreateMutex();
+
+    // 配置要在 USB 通道开始受理命令之前就读好，否则 get_net 会答出一串空字段。
+    terminal_net_preload();
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -314,7 +324,9 @@ esp_err_t terminal_net_start(void) {
     }
 
     ESP_LOGI(TAG, "连接 Wi-Fi \"%s\"，服务器 %s:%d", s_ssid, s_host, s_port);
-    return esp_wifi_start();
+    const esp_err_t start_err = esp_wifi_start();
+    if (start_err == ESP_OK) s_wifi_started = true;
+    return start_err;
 }
 
 esp_err_t terminal_net_apply(const char *ssid, const char *password, const char *host, int port) {
@@ -333,6 +345,15 @@ esp_err_t terminal_net_apply(const char *ssid, const char *password, const char 
     if (port > 0 && port < 65536) s_port = port;
 
     config_save();
+
+    // USB 通道比 Wi-Fi 初始化更早就绪，主机若在启动瞬间下发 set_net，此时驱动还不存在，
+    // 直接调 esp_wifi_* 是未定义行为。只落盘，交给随后的初始化生效。
+    if (!s_wifi_started) {
+        ESP_LOGI(TAG, "网络参数已保存，将在 Wi-Fi 初始化后生效: ssid=\"%s\" server=%s:%d", s_ssid,
+                 s_host, s_port);
+        return ESP_OK;
+    }
+
     drop_link("reconfigured");
     wifi_apply_sta();
 
