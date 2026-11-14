@@ -147,7 +147,7 @@ static void feed(const char *data, int len) {
         if (ch == '\n') {
             if (s_rx_discard) {
                 s_rx_discard = false;
-                terminal_link_send("{\"ok\":false,\"err\":\"line too long\"}\n");
+                terminal_link_send("{\"ok\":false,\"err\":\"line_too_long\"}\n");
             } else {
                 s_line[s_line_len] = '\0';
                 if (s_line_len > 0) terminal_link_dispatch(s_line);
@@ -464,6 +464,7 @@ esp_err_t terminal_net_scan(char *buf, size_t n) {
 
     esp_err_t err = ESP_OK;
     uint16_t found = 0;
+    uint16_t total = 0;  // 芯片扫到的总数，用来判断输出是否被截断
     wifi_ap_record_t *recs = NULL;
 
     // 单一出口：任何一条失败路径都必须把 s_scanning 清掉并重新发起连接，
@@ -472,6 +473,7 @@ esp_err_t terminal_net_scan(char *buf, size_t n) {
     if (err != ESP_OK) goto done;
 
     esp_wifi_scan_get_ap_num(&found);
+    total = found;
     if (found > MAX_SCAN_APS) found = MAX_SCAN_APS;
 
     if (found > 0) {
@@ -507,7 +509,9 @@ esp_err_t terminal_net_scan(char *buf, size_t n) {
     used = str_append(buf, n, used, "],\"count\":");
     char num[8];
     snprintf(num, sizeof num, "%u", emitted);
-    str_append(buf, n, used, num);
+    used = str_append(buf, n, used, num);
+    // 只在真截断时带 truncated：服务端据此知道列表不完整，而不是以为附近只有这么几个 AP。
+    if (emitted < total) str_append(buf, n, used, ",\"truncated\":true");
 
 done:
     free(recs);

@@ -10,7 +10,8 @@
 // 起一个后台任务：录 ms 毫秒（16 kHz/单声道/s16le）后原样回放，结束发
 // {"event":"audio_selftest",...}。非阻塞，成功后立刻返回；正在跑时返回
 // ESP_ERR_INVALID_STATE（同一时刻只允许一个自测，避免两个任务抢同一个 codec）。
-esp_err_t terminal_audio_selftest_start(int ms);
+// frame_ms 只接受 20 或 40（协议 D6 待定项），其它值返回 ESP_ERR_INVALID_ARG。
+esp_err_t terminal_audio_selftest_start(int ms, int frame_ms);
 
 // 是否有自测正在跑。
 bool terminal_audio_busy(void);

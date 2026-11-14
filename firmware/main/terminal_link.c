@@ -141,7 +141,7 @@ void terminal_link_dispatch(char *line) {
     if (!line || !*line) return;
 
     // 只处理以 '{' 开头的行。接到的可能不是我们自己人：路由器/HTTP 网关/任何误连上来
-    // 的东西都会往 socket 里写非 JSON 字节，若逐行回 "bad json" 就会变成回复风暴，
+    // 的东西都会往 socket 里写非 JSON 字节，若逐行回 "bad_json" 就会变成回复风暴，
     // 把链路彻底淹掉。协议一致规定：不像 JSON 的行直接丢掉。
     while (*line == ' ' || *line == '\t') line++;
     if (*line != '{') return;
@@ -149,7 +149,7 @@ void terminal_link_dispatch(char *line) {
     cJSON *root = cJSON_Parse(line);
     if (!root) {
         // 以 '{' 开头却解析失败，多半是真正想调命令却拼错了，此时报错才有助于调试。
-        terminal_link_send("{\"ok\":false,\"err\":\"bad json\"}\n");
+        terminal_link_send("{\"ok\":false,\"err\":\"bad_json\"}\n");
         return;
     }
 
@@ -218,7 +218,8 @@ void terminal_link_dispatch(char *line) {
     } else if (strcmp(c, "audio_selftest") == 0) {
         // 设备侧音频自测：录一段再原样回放，用来验证 codec 采播与帧时序。
         const int ms = int_field(root, "ms", 2000);
-        const esp_err_t err = terminal_audio_selftest_start(ms);
+        const int frame_ms = int_field(root, "frame_ms", 20);
+        const esp_err_t err = terminal_audio_selftest_start(ms, frame_ms);
         if (err == ESP_OK) {
             send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"audio_selftest\",\"ms\":%d}\n", id, ms);
         } else {
@@ -226,7 +227,7 @@ void terminal_link_dispatch(char *line) {
                      esp_err_to_name(err));
         }
     } else {
-        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"unknown cmd\"}\n", id);
+        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"unknown_cmd\"}\n", id);
     }
 
     cJSON_Delete(root);

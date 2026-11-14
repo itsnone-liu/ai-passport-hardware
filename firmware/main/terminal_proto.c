@@ -47,7 +47,7 @@ static void proto_task(void *arg) {
                 if (discard) {
                     // 静默丢掉半截命令会让主机以为命令生效了；明确告诉它太长。
                     discard = false;
-                    terminal_link_send("{\"ok\":false,\"err\":\"line too long\"}\n");
+                    terminal_link_send("{\"ok\":false,\"err\":\"line_too_long\"}\n");
                 } else {
                     line[len] = '\0';
                     if (len > 0) terminal_link_dispatch(line);

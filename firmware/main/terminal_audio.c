@@ -22,11 +22,17 @@
 static const char *TAG = "audio";
 
 #define SAMPLE_HZ 16000
-#define FRAME_MS 20
-#define FRAME_SAMPLES (SAMPLE_HZ / 1000 * FRAME_MS)  // 320
-#define FRAME_BYTES (FRAME_SAMPLES * 2)              // 640
+#define FRAME_MS_DEFAULT 20
+#define FRAME_MS_MAX 40
+#define FRAME_BYTES_MAX (SAMPLE_HZ / 1000 * FRAME_MS_MAX * 2)  // 1280
 #define MAX_RECORD_MS 2000  // 再长就要 128 KB 连续堆，实测分配不出来（见 no mem 分支）
 #define TASK_STACK 6144
+
+// 协议 D6 要在 20 ms / 40 ms 之间做决定，所以帧长做成可选的：
+// 参数用一个 int 同时捎带两个值，避免为一次自测去申请结构体。
+#define ARG_PACK(ms, frame) (((ms) & 0xFFFF) | ((frame) << 16))
+#define ARG_MS(a) ((int)((a) & 0xFFFF))
+#define ARG_FRAME(a) ((int)(((a) >> 16) & 0xFFFF))
 
 static volatile bool s_busy;
 static uint32_t s_seq;
@@ -41,13 +47,17 @@ static void emit(const char *fmt, ...) {
 }
 
 static void selftest_task(void *arg) {
-    const int want_ms = (int)(intptr_t)arg;
+    const int packed = (int)(intptr_t)arg;
+    const int want_ms = ARG_MS(packed);
+    int frame_ms = ARG_FRAME(packed);
+    if (frame_ms != 20 && frame_ms != 40) frame_ms = FRAME_MS_DEFAULT;
+    const int frame_bytes = SAMPLE_HZ / 1000 * frame_ms * 2;  // 20 ms→640 B, 40 ms→1280 B
 
     int rec_ms = want_ms;
-    if (rec_ms < FRAME_MS) rec_ms = FRAME_MS;
+    if (rec_ms < frame_ms) rec_ms = frame_ms;
     if (rec_ms > MAX_RECORD_MS) rec_ms = MAX_RECORD_MS;
-    const int frames = rec_ms / FRAME_MS;
-    const size_t total = (size_t)frames * FRAME_BYTES;
+    const int frames = rec_ms / frame_ms;
+    const size_t total = (size_t)frames * (size_t)frame_bytes;
 
     // 明确用堆而不是栈：4 秒就是 128 KB，任何任务栈都放不下。
     int16_t *buf = malloc(total);
@@ -77,9 +87,10 @@ static void selftest_task(void *arg) {
     int read_fail = 0;
     const int64_t t_rec0 = esp_timer_get_time();
     for (int i = 0; i < frames; i++) {
-        const esp_err_t r = bsp_audio_read((uint8_t *)buf + (size_t)i * FRAME_BYTES, FRAME_BYTES);
+        const esp_err_t r =
+            bsp_audio_read((uint8_t *)buf + (size_t)i * (size_t)frame_bytes, frame_bytes);
         if (r == ESP_OK) {
-            got_bytes += FRAME_BYTES;
+            got_bytes += (size_t)frame_bytes;
         } else {
             read_fail++;
         }
@@ -116,7 +127,8 @@ static void selftest_task(void *arg) {
     int write_fail = 0;
     const int64_t t_play0 = esp_timer_get_time();
     for (int i = 0; i < frames; i++) {
-        if (bsp_audio_write((uint8_t *)buf + (size_t)i * FRAME_BYTES, FRAME_BYTES) != ESP_OK) {
+        if (bsp_audio_write((uint8_t *)buf + (size_t)i * (size_t)frame_bytes, frame_bytes) !=
+            ESP_OK) {
             write_fail++;
         }
     }
@@ -131,23 +143,24 @@ static void selftest_task(void *arg) {
     // ratio/100 = 实际耗时 ÷ 名义时长。接近 100 说明帧节拍与 codec 时钟一致；
     // 明显小于 100 说明读接口没在等时钟（数据是凭空返回的），大于 100 说明欠载。
     emit("{\"event\":\"audio_selftest\",\"ok\":true,\"seq\":%u,\"format\":\"pcm_s16le/%d/1\","
-         "\"frame_ms\":%d,\"frames\":%d,\"bytes\":%u,\"rms\":%d,\"peak\":%d,\"dc\":%d,"
-         "\"clips\":%d,\"nonzero\":%d,"
+         "\"frame_ms\":%d,\"frames\":%d,\"frame_bytes\":%d,\"bytes\":%u,\"rms\":%d,\"peak\":%d,"
+         "\"dc\":%d,\"clips\":%d,\"nonzero\":%d,"
          "\"record_ms\":%d,\"play_ms\":%d,\"rate_ratio\":%d,\"read_fail\":%d,\"write_fail\":%d}\n",
-         (unsigned)++s_seq, SAMPLE_HZ, FRAME_MS, frames, (unsigned)got_bytes, rms, peak, dc, clips,
-         nonzero, rec_elapsed, play_elapsed, rec_ms ? (rec_elapsed * 100 / rec_ms) : 0, read_fail,
-         write_fail);
+         (unsigned)++s_seq, SAMPLE_HZ, frame_ms, frames, frame_bytes, (unsigned)got_bytes, rms, peak,
+         dc, clips, nonzero, rec_elapsed, play_elapsed,
+         rec_ms ? (rec_elapsed * 100 / rec_ms) : 0, read_fail, write_fail);
 
     free(buf);
     s_busy = false;
     vTaskDelete(NULL);
 }
 
-esp_err_t terminal_audio_selftest_start(int ms) {
+esp_err_t terminal_audio_selftest_start(int ms, int frame_ms) {
     if (s_busy) return ESP_ERR_INVALID_STATE;
+    if (frame_ms != 20 && frame_ms != 40) return ESP_ERR_INVALID_ARG;
     s_busy = true;
-    if (xTaskCreate(selftest_task, "dsh_audio_test", TASK_STACK, (void *)(intptr_t)ms, 4, NULL) !=
-        pdPASS) {
+    if (xTaskCreate(selftest_task, "dsh_audio_test", TASK_STACK,
+                    (void *)(intptr_t)ARG_PACK(ms, frame_ms), 4, NULL) != pdPASS) {
         s_busy = false;
         return ESP_ERR_NO_MEM;
     }
