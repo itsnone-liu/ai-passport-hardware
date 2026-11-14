@@ -5,6 +5,7 @@
 #include "terminal_adpcm.h"
 #include "terminal_link.h"
 #include "terminal_pav1.h"
+#include "terminal_udp.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -239,13 +240,26 @@ static void flush_preroll(void) {
 
 // 把待发环尽量写出去。返回 1 = 已排空；0 = 此刻写不进去（对端窗口关/ACK 未回）；
 // -1 = 通道已死。
+//
+// UDP 优先：一旦服务端用 ack 证明了它听得见我们的 UDP，就走数据报。
+// 这里没有"写不进去"这个状态——UDP 要么交出去要么失败，所以环不会因为
+// 对端窗口关闭而堆积（TCP 版的 frames=4/dropped=92 那个坑在 UDP 下不存在）。
+// 失败不回退到 TCP：半路换传输会把两块音频的顺序弄乱，不如丢这一块（20 ms）。
 static int drain_pending(void) {
     while (s_pend_count > 0) {
         const int slot = s_pend_head;
-        const int r = (s_codec == CAP_CODEC_ADPCM)
-                          ? terminal_pav1_send_adpcm_nowait(s_turn, s_pend_seq[slot],
-                                                            s_pend[slot], s_pend_len[slot])
-                          : terminal_pav1_send_pcm_nowait(s_turn, s_pend[slot], s_pend_len[slot]);
+        int r;
+        if (s_codec == CAP_CODEC_ADPCM && terminal_udp_ready()) {
+            r = terminal_udp_send_adpcm(s_turn, s_pend_seq[slot], s_pend[slot],
+                                        s_pend_len[slot])
+                    ? 1
+                    : -1;
+        } else {
+            r = (s_codec == CAP_CODEC_ADPCM)
+                    ? terminal_pav1_send_adpcm_nowait(s_turn, s_pend_seq[slot], s_pend[slot],
+                                                      s_pend_len[slot])
+                    : terminal_pav1_send_pcm_nowait(s_turn, s_pend[slot], s_pend_len[slot]);
+        }
         if (r > 0) {
             s_sent_frames++;
             pend_pop();
@@ -545,6 +559,13 @@ void terminal_capture_get_audio(char *buf, size_t n) {
              (unsigned)s_turns, s_samples ? (int)(sqrt(s_sum_sq / (double)s_samples) + 0.5) : 0,
              (int)s_peak, (unsigned)s_pre_frames, (unsigned)(s_pre_frames * 20), pre_rms,
              (int)s_pre_peak, s_pend_count, pend_age_ms(), s_pend_count * 20, (unsigned)s_seq);
+    // UDP 通道自证：ready 之前采集一定还在走 TCP，所以这两个字段能直接
+    // 说明"这一轮的音频到底走的是哪条路"。
+    const size_t used = strlen(buf);
+    if (used + 2 < n) {
+        buf[used] = ',';
+        terminal_udp_diag(buf + used + 1, n - used - 1);
+    }
 }
 
 void terminal_capture_describe(char *buf, size_t n) {

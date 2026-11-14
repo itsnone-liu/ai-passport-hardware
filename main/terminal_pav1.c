@@ -5,6 +5,7 @@
 #include "terminal_capture.h"
 #include "terminal_link.h"
 #include "terminal_playback.h"
+#include "terminal_udp.h"
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -184,6 +185,7 @@ static volatile bool s_should_run;
 static volatile bool s_ready;
 static char s_host[64];
 static int s_port;
+static volatile uint32_t s_peer_ip;  // 音频通道对端 IP（UDP 打洞用）
 static uint32_t s_rx_frames, s_rx_bytes, s_rx_end, s_tx_frames, s_tx_bytes;
 static volatile bool s_rx_only;  // 隔离实验期间：只收不播
 static volatile uint32_t s_rx_bad;
@@ -347,6 +349,8 @@ static int dial(const char *host, int port) {
         freeaddrinfo(res);
         return -1;
     }
+    // 记下对端 IP：UDP 打洞要用同一个地址（服务端 TCP/UDP 同端口）。
+    s_peer_ip = ((const struct sockaddr_in *)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);
     // 音频 socket 设成非阻塞。⚠ 只做这一步会出事：pav1 的读循环原本靠阻塞 recv
     // 过日子，一改非阻塞 recv 立刻返回 EAGAIN，那个"等到 deadline"的循环就变成
@@ -378,6 +382,7 @@ static void close_sock(void) {
     s_abort_close = false;
     if (s_tx_mu) xSemaphoreGive(s_tx_mu);
     s_ready = false;
+    terminal_udp_stop();  // 通道重建后对端可能变，UDP 要重新打洞
 }
 
 static bool json_ok(const cJSON *root, const cJSON **err_out) {
@@ -478,6 +483,9 @@ static bool do_handshake(void) {
     s_ready = true;
     ESP_LOGI(TAG, "音频通道就绪 %s:%d（session=%s）", s_host, s_port,
              terminal_auth_session_id());
+    // TCP 音频通道一通，就顺手在同一地址上开 UDP 打洞。打洞成功前采集仍然
+    // 走这条 TCP 通道，所以这里失败也不影响可用性（W0-9 第 3 段）。
+    if (s_peer_ip) terminal_udp_start(s_peer_ip, (uint16_t)s_port);
     return true;
 }
 
@@ -541,7 +549,13 @@ static void serve(void) {
     while (s_should_run) {
         if (terminal_capture_capturing()) {
             const int64_t wd_now = esp_timer_get_time();
-            if (s_tx_frames != wd_ref) {
+            if (terminal_udp_ready()) {
+                // 音频走 UDP 时，这条 TCP 上按定义不会有音频字节，所以
+                // "没有帧送出"不再说明对端不读——它是正常状态。
+                // 这里只清参考点，绝不动手收轮：否则每 2 秒就把一轮掐断。
+                wd_ref = s_tx_frames;
+                wd_since = wd_now;
+            } else if (s_tx_frames != wd_ref) {
                 wd_ref = s_tx_frames;
                 wd_since = wd_now;
             } else if ((wd_now - wd_since) / 1000 > UPLINK_STALL_MS) {

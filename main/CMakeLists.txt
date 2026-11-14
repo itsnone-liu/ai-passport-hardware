@@ -11,6 +11,7 @@ idf_component_register(
          "terminal_pav1.c"
          "terminal_opus.c"
          "terminal_adpcm.c"
+         "terminal_udp.c"
          "terminal_boot.c"
     INCLUDE_DIRS "."
     REQUIRES bsp
