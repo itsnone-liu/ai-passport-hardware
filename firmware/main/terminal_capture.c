@@ -22,6 +22,7 @@ static const char *TAG = "cap";
 #define MAX_TURN_MS 30000            // 与服务端 30 s 缓冲上限对齐
 #define DROP_LIMIT 25                // 连续丢 25 帧（500 ms）判 overflow
 #define ARM_TIMEOUT_MS 1500          // 按键后等 capture.start 的时限
+#define STALL_MS 2000                // 连续这么久没有一帧送出去 = 上行已死，收轮
 
 static uint8_t s_pre[PREROLL_FRAMES][FRAME_BYTES];
 static int s_pre_count;
@@ -39,6 +40,8 @@ static TaskHandle_t s_task;
 static int64_t s_turn_start_us;
 static int64_t s_arm_start_us;
 static uint32_t s_sent_frames;
+static uint32_t s_stall_ref_frames;   // 上次判定"还在动"时的 s_sent_frames
+static int64_t s_last_sent_us;        // 上次"还在动"的墙钟
 static uint32_t s_dropped;
 static uint32_t s_overflows;
 static uint32_t s_turns;
@@ -112,6 +115,8 @@ static void begin_turn(void) {
     s_armed = false;
     s_turn_start_us = esp_timer_get_time();
     s_sent_frames = 0;
+    s_stall_ref_frames = 0;
+    s_last_sent_us = s_turn_start_us;
     s_dropped = 0;
     s_sum_sq = 0;
     s_samples = 0;
@@ -120,7 +125,8 @@ static void begin_turn(void) {
     set_state("listening");
     flush_preroll();
     emit_capture_started(s_turn, pre_ms);
-    ESP_LOGI(TAG, "轮次 %u 开始（pre-roll %d ms）", (unsigned)s_turn, pre_ms);
+    ESP_LOGI(TAG, "轮次 %u 开始（pre-roll %d ms，heap=%u）", (unsigned)s_turn, pre_ms,
+             (unsigned)esp_get_free_heap_size());
 }
 
 static void finish_turn(const char *reason) {
@@ -168,6 +174,21 @@ static void capture_task(void *arg) {
         if (s_active) {
             if (s_req_stop) {
                 finish_turn("released");
+                continue;
+            }
+            // 卡死检测（按墙钟，不按丢帧计数）：对端不读时，丢帧计数要 25 次才收轮，
+            // 而每次 send 都可能阻塞几百毫秒，加起来是几十秒的"看起来还在采集"。
+            // 用"连续 STALL_MS 没有一帧送出去"来判定，时间边界是可解释的。
+            const int64_t now_us = esp_timer_get_time();
+            if (s_sent_frames != s_stall_ref_frames) {
+                s_stall_ref_frames = s_sent_frames;
+                s_last_sent_us = now_us;
+            } else if ((now_us - s_last_sent_us) / 1000 > STALL_MS) {
+                ESP_LOGW(TAG, "上行卡住 %d ms（已送 %u 帧），收轮", STALL_MS,
+                         (unsigned)s_sent_frames);
+                s_overflows++;
+                emit_error("audio_overflow", s_turn);
+                finish_turn("error");
                 continue;
             }
             if ((esp_timer_get_time() - s_turn_start_us) / 1000 > MAX_TURN_MS) {
@@ -232,6 +253,27 @@ esp_err_t terminal_capture_stop(uint32_t turn_id) {
     s_stop_turn = turn_id;
     s_req_stop = true;
     return ESP_OK;
+}
+
+// 扫描热点必须断开 Wi-Fi，而采集正靠 Wi-Fi 送帧。给 scan 一个"现在能不能打断"的判断：
+// armed 也算忙——那时 pre-roll 正在填，断开就等于把这一轮的开口吃掉。
+bool terminal_capture_busy(void) { return s_active || s_armed; }
+
+// 只表示"正在为某一轮送实时帧"。上行看门狗用它：armed 阶段还没有帧要送，
+// 拿"没有进展"去判它会误杀"按键预热完等 capture.start"的正常流程。
+bool terminal_capture_capturing(void) { return s_active; }
+
+// 从别的任务强制收轮。存在的理由：采集任务自己可能阻塞在 I2S 读或 socket 发送里，
+// 这时它能做的检查一个都跑不到。收轮必须由还活着的那个人完成。
+void terminal_capture_force_stop(const char *reason) {
+    if (!s_active && !s_armed) return;
+    const uint32_t turn = s_turn;
+    s_active = false;
+    s_armed = false;
+    s_req_stop = false;
+    emit_capture_ended(turn, reason);
+    set_state("processing");
+    ESP_LOGW(TAG, "轮次 %u 被强制收尾（%s）", (unsigned)turn, reason);
 }
 
 void terminal_capture_arm(void) {

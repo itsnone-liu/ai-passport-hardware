@@ -25,5 +25,8 @@ void terminal_playback_mark_end(uint32_t turn_id);
 // get_audio 用的排障字段。
 void terminal_playback_describe(char *buf, size_t n);
 
+// true = 有一轮在缓冲或播放。scan 之类需要断开 Wi-Fi 的操作靠它避让。
+bool terminal_playback_busy(void);
+
 // 厂商自测：按服务端节奏把正弦推进播放环，走真环/真任务/真 I2S。
 esp_err_t terminal_playback_selftest(int ms, int speed);

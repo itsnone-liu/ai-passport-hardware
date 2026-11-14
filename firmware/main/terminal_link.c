@@ -311,6 +311,10 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         const esp_err_t err = terminal_net_scan(s_scan, sizeof s_scan);
         if (err == ESP_OK) {
             reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"scan\",%s}\n", id, s_scan);
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            // 扫描必须断开 Wi-Fi 才能进行，语音进行中去扫会把这一轮说断。
+            // 明确回 busy，让调用方知道"现在不行、等会儿行"，而不是报一个看起来像故障的错误。
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"scan\",\"err\":\"busy\"}\n", id);
         } else {
             reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"scan\",\"err\":\"%s\"}\n", id,
                       esp_err_to_name(err));

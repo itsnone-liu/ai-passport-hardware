@@ -282,6 +282,8 @@ void terminal_playback_mark_end(uint32_t turn_id) {
     if (s_task) xTaskNotifyGive(s_task);
 }
 
+bool terminal_playback_busy(void) { return s_state != PB_IDLE; }
+
 void terminal_playback_describe(char *buf, size_t n) {
     if (!buf || n == 0) return;
     int have;

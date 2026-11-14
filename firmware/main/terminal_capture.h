@@ -20,6 +20,15 @@ esp_err_t terminal_capture_stop(uint32_t turn_id);
 // 本机按键触发：开始填 pre-roll 并等 capture.start，超时按 cap_start_timeout 放弃。
 void terminal_capture_arm(void);
 
+// true = 有轮次正在进行（armed 或 capturing）。scan 之类需要断开 Wi-Fi 的操作靠它避让。
+bool terminal_capture_busy(void);
+
+// true = 正在为某一轮送实时帧（不含 armed）。
+bool terminal_capture_capturing(void);
+
+// 从其它任务强制收尾（采集任务自己阻塞时，只有还活着的人能救场）。
+void terminal_capture_force_stop(const char *reason);
+
 // get_audio 用：state/ring_ms/underruns/overflows 等排障字段（JSON 片段，不含引号外壳）。
 void terminal_capture_get_audio(char *buf, size_t n);
 

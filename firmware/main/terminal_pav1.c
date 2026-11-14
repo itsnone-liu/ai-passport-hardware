@@ -2,6 +2,7 @@
 #include "terminal_pav1.h"
 
 #include "terminal_auth.h"
+#include "terminal_capture.h"
 #include "terminal_link.h"
 #include "terminal_playback.h"
 
@@ -26,6 +27,7 @@ static const char *TAG = "pav1";
 #define RECV_TIMEOUT_S 1  // 短一点：空闲时也要能及时响应"该发帧了"这类本地请求
 #define IDLE_DROP_S 180
 #define RX_BUF 4096  // 一次 recv 尽量多取：1024 B 只能装 1.6 帧，收得再快也补不回窗口
+#define UPLINK_STALL_MS 2000  // 连续这么久没有一帧送出去 = 对端不读，收轮并重建通道
 
 static const uint8_t k_magic[4] = {'P', 'A', 'V', '1'};
 
@@ -172,6 +174,7 @@ typedef struct {
 } rx_frame_t;
 
 static int s_sock = -1;
+static volatile bool s_abort_close;  // 下次 close_sock 用 RST 而不是 FIN（上行已死时）
 static SemaphoreHandle_t s_tx_mu;
 static TaskHandle_t s_task;
 static SemaphoreHandle_t s_wake;  // 单值信号量：start() 叫醒任务
@@ -270,7 +273,11 @@ static int dial(const char *host, int port) {
         freeaddrinfo(res);
         return -1;
     }
-    const struct timeval snd = {.tv_sec = 5, .tv_usec = 0};
+    // 音频数据的发送超时必须短。一帧只有 20 ms，如果 250 ms 还塞不进协议栈，说明对端
+    // 已经不读或者链路断了；此时继续等 5 秒，等于把"对端不读"变成"设备内存耗尽"——
+    // 实测过：缓冲区装到 28 帧后每帧阻塞 5 s，堆从 28 KB 掉到 1.8 KB，连 capture.stop
+    // 都进不来。短超时让采集循环能及时回到 s_req_stop 的判断上。
+    const struct timeval snd = {.tv_sec = 0, .tv_usec = 250000};
     const struct timeval rcv = {.tv_sec = RECV_TIMEOUT_S, .tv_usec = 0};
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &snd, sizeof snd);
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof rcv);
@@ -295,9 +302,19 @@ static int dial(const char *host, int port) {
 static void close_sock(void) {
     if (s_tx_mu) xSemaphoreTake(s_tx_mu, portMAX_DELAY);
     if (s_sock >= 0) {
+        if (s_abort_close) {
+            // 对端不读的时候不能优雅关闭：socket 里那十几 KB 未确认数据会连同 pcb 一起
+            // 挂在 FIN_WAIT，等不到 ACK 就一直占着内存。实测轮次结束后堆停在 4.2 KB、
+            // 音频通道再也连不回来。SO_LINGER{1,0} 让 close 直接发 RST，把 pcb 和
+            // 重传队列当场释放——音频是"过期即废"的数据，不值得为它保序重传。
+            const struct linger lg = {.l_onoff = 1, .l_linger = 0};
+            setsockopt(s_sock, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+            ESP_LOGW(TAG, "RST 关闭音频通道（heap=%u）", (unsigned)esp_get_free_heap_size());
+        }
         close(s_sock);
         s_sock = -1;
     }
+    s_abort_close = false;
     if (s_tx_mu) xSemaphoreGive(s_tx_mu);
     s_ready = false;
 }
@@ -455,7 +472,31 @@ static void do_uplink_test(void) {
 static void serve(void) {
     static uint8_t rx[RX_BUF];
     int64_t last_rx = esp_timer_get_time();
+    // 上行看门狗：对端不读时，发送会一路堵死，采集任务自己卡在 send 里，什么检查都跑不到。
+    // 这个循环至少每秒醒一次（recv 超时 1 s），是全设备唯一还在动的观察点。
+    // 判据用"已发出帧数是否还在涨"，不用丢帧计数——后者取决于每次 send 阻塞多久。
+    uint32_t wd_ref = s_tx_frames;
+    int64_t wd_since = esp_timer_get_time();
     while (s_should_run) {
+        if (terminal_capture_capturing()) {
+            const int64_t wd_now = esp_timer_get_time();
+            if (s_tx_frames != wd_ref) {
+                wd_ref = s_tx_frames;
+                wd_since = wd_now;
+            } else if ((wd_now - wd_since) / 1000 > UPLINK_STALL_MS) {
+                ESP_LOGW(TAG, "上行 %d ms 没有一帧送出，收轮并重建音频通道", UPLINK_STALL_MS);
+                terminal_capture_force_stop("uplink_stall");
+                // 必须关连接：只收轮不关，socket 里那十几 KB 未确认数据不会还回来，
+                // 实测轮次结束后堆停在 1.4 KB、block 896，设备再也恢复不了。
+                // 而且必须用 RST 关（见 close_sock）：对端不 ACK 时优雅关闭会把
+                // pcb 和重传队列一起挂住。
+                s_abort_close = true;
+                return;
+            }
+        } else {
+            wd_ref = s_tx_frames;
+            wd_since = esp_timer_get_time();
+        }
         if (s_ul_req) do_uplink_test();
         if (s_sock < 0) return;
         const int n = recv(s_sock, rx, sizeof rx, 0);
@@ -537,6 +578,7 @@ void terminal_pav1_start(const char *host, int port) {
 
 void terminal_pav1_stop(void) {
     if (!s_should_run && !s_ready) return;
+    ESP_LOGW(TAG, "停音频通道（heap=%u）", (unsigned)esp_get_free_heap_size());
     s_should_run = false;
     s_ready = false;
     // 跨任务只做 shutdown：它能叫醒阻塞中的 recv，而 close 留给持有者做。

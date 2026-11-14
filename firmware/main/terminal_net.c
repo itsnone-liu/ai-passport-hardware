@@ -19,7 +19,9 @@
 #include "nvs_flash.h"
 #include "terminal_link.h"
 #include "terminal_auth.h"
+#include "terminal_capture.h"
 #include "terminal_pav1.h"
+#include "terminal_playback.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -577,6 +579,13 @@ esp_err_t terminal_net_scan(char *buf, size_t n) {
     wifi_scan_config_t sc;
     memset(&sc, 0, sizeof sc);
     sc.show_hidden = true;
+
+    // 语音进行中不许扫：扫描必须先断开 Wi-Fi，而现在这一轮的音频正走在 Wi-Fi 上。
+    // 曾经的设计是"扫完自动重连"，听着无害，但对进行中的语音就是当场断流。
+    if (terminal_capture_busy() || terminal_playback_busy()) {
+        ESP_LOGW(TAG, "scan 被拒绝：语音进行中");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     // esp_wifi_scan_start 在"正在连接"状态下会返回 ESP_ERR_WIFI_STATE，
     // 所以先主动断开并让重连逻辑暂停，扫完再交还。

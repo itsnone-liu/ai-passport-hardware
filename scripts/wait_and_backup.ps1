@@ -12,8 +12,11 @@ function Get-EspPort {
         $dev = Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -match [regex]::Escape("($p)") }
         if ($dev -and ($dev.InstanceId -like 'USB\VID_303A*')) { return $p }
     }
-    # 端口存在但名称匹配不到时，退回第一个端口
-    return $ports[0]
+    # 绝不退回"第一个端口"。
+    # 这个脚本接下来要做的是把 8 MB 镜像写进设备；如果按名字匹配不到就随手挑一个端口，
+    # 插在旁边的任何一块板子、任何一个 USB 串口设备都可能被当成本机写进去。
+    # 找不到就返回 $null，让调用方继续等——宁可等，不可猜。
+    return $null
 }
 
 "$(Get-Date -Format 'HH:mm:ss') 开始等待设备插入（最长 20 分钟）..."
