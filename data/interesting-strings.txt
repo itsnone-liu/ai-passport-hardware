@@ -1,0 +1,72 @@
+# 固件中的关键字符串（已脱敏、去重、分类）
+
+来源：对 app 镜像做 strings 扫描 + 串口运行日志。凭据类内容已剔除。
+
+## 身份与产线
+
+```
+trae_card
+2.1.0-xiaozhi.29
+ai-passport-leogie
+AT+CARDID=
+AT+TEST?
+at=config=?
+at=command=?
+at+reboot
+identity: 身份载入: SN=%s hw=%s provisioned=%d
+identity: SN 缺失,已按 WIFI_STA MAC 自补: %s
+prov: 产线指令就绪
+app: 未写入 Key/ProductKey,小程序绑定与 token 广播不可用。请用 AT+CARDID= 指令写入或烧录 cardid 分区
+```
+
+## 云端 / 协议
+
+```
+https://api.tenclass.net/xiaozhi/ota/
+api.tenclass.net
+GID_test@@@%s@@@%s          # client_id 模板：GID_test@@@<mac>@@@<uuid>
+device-server               # MQTT publish topic
+xiaozhi/mqtt_cache_v1       # NVS 中的凭据缓存键
+```
+
+## 分区 / 资源
+
+```
+petart
+companion
+imgava
+theme_cache
+cardid
+imgframe
+imgstore
+imguser
+recovery
+netcfg
+pet_art: Mapped %d petart bytes from 0x%x
+companion: Missing/mismatched resource pack
+```
+
+## 板级外设（BSP）
+
+```
+bsp_i2c: 发现设备 @ 0x18 <- ES8311
+bsp_i2c: 发现设备 @ 0x63 <- CW2017 电量计
+bsp_batt: 优特利 520mAh profile 已匹配
+ESP_ERR_WIFI_PASSWORD
+ap.passwd
+DeviceSecret
+```
+
+## mbedTLS / 加密相关（说明固件带 TLS）
+
+```
+mbedtls_ssl_handshake
+mbedtls_x509_crt_parse
+tls12
+```
+
+## 观察到但未能确认的
+
+- `recovery` 分区在设备上是**全 0xFF**（空），说明工厂恢复区未写入内容
+- `theme_cache`、`imguser` 等分区同样为空，属于"预留"状态
+- BLE 名称为 `AI Passport` 风格，但实际广播需要配对后才可见（本次未做 BLE 抓包）

@@ -1,0 +1,153 @@
+备份文件 : D:\dsh-work\flash\full-backup.bin
+大小     : 8388608 bytes (8.00 MB)
+SHA256   : e1993d959acff4fc05182b2ac3e02fa93f0e51c99b050431ab9b72008d4c1ac9
+MD5      : 6e69d1bc3711cb6c778bfcca70fd6c56
+
+==============================================================================
+分区表与每区概况
+==============================================================================
+label         type/sub            offset      size  MD5(前16)              熵  文件系统
+nvs           data/nvs            0x9000     24576  d0ee8c6262ade721   3.05  NVS
+phy_init      data/phy            0xf000      4096  6ae59e64850377ee  -0.00  空（全 0xFF）
+factory       app/factory        0x10000   2940928  2dd052a5acb4cb26   7.43  未知/自定义
+petart        data/0x40         0x2de000    905216  3b7302286920575d   7.59  未知/自定义
+companion     data/0x41         0x3bb000   1646592  61db709c808b218e   7.83  未知/自定义
+imgava        data/spiffs       0x54d000    131072  4b050e18036b2ea3   7.96  未知/自定义
+assets        data/spiffs       0x56d000    942080  af0022f363a7c8ea  -0.00  空（全 0xFF）
+theme_cache   data/0x42         0x653000     94208  7b216583a9f776e9  -0.00  空（全 0xFF）
+cardid        data/nvs          0x66a000     16384  76c196066333b0fa   0.06  NVS
+imgframe      data/spiffs       0x66e000    155648  9c3290eeb61d9f5b  -0.00  空（全 0xFF）
+imgstore      data/spiffs       0x694000     32768  3df7b33399422731  -0.00  空（全 0xFF）
+imguser       data/spiffs       0x69c000     32768  3df7b33399422731  -0.00  空（全 0xFF）
+audio         data/spiffs       0x6a4000     81920  2cb999cddbdc8c8e  -0.00  空（全 0xFF）
+netcfg        data/nvs          0x6bc000     16384  92ab673d915a94dc  -0.00  空（全 0xFF）
+recovery      app/test          0x6c0000   1310720  804fa5d7b70c848c  -0.00  空（全 0xFF）
+
+==============================================================================
+网络端点（固件里硬编码的服务器地址）
+==============================================================================
+--- URL ---
+  https://github.com/fontworks-fonts/Klee)   (x3)
+  https://github.com/lxgw/LxgwWenKai)   (x2)
+  https://github.com/JulietaUla/Montserrat)   (x2)
+  https://openfontlicense.org   (x2)
+  http://scripts.sil.org/OFL   (x2)
+  https://fontawesome.com)   (x2)
+  https://geocoding-api.open-meteo.com/v1/search?name=%s&count=5&language=zh   (x1)
+  https://api.open-meteo.com/v1/forecast?latitude=%.5f&longitude=%.5f&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,   (x1)
+  https://%s.api.radio-browser.info/json/stations/search?countrycode=CN&name=%s&codec=MP3&hidebroken=true&order=clickcount&reverse=true&limit=15   (x1)
+  http://lhttp.qingting.fm/live/%s/64k.mp3   (x1)
+  http://192.168.4.1/   (x1)
+  http://192.168.4.1/'   (x1)
+  https://api.tenclass.net/xiaozhi/ota/   (x1)
+  https://ai-passport.folotoy.cn?s=   (x1)
+  https://github.com/lxgw/LxgwWenKai/releases/tag/v1.522   (x1)
+  https://github.com/JulietaUla/Montserrat   (x1)
+  https://github.com/FortAwesome/Font-Awesome/tree/5.9.0   (x1)
+  https://github.com/lvgl/lvgl/tree/v9.5.0/scripts/built_in_font   (x1)
+  https://github.com/lxgw/LxgwWenKai),   (x1)
+  https://fontawesome.com/license/free.   (x1)
+  https://creativecommons.org/licenses/by/4.0/)   (x1)
+  https://opensource.org/licenses/MIT)   (x1)
+--- 域名 ---
+  ssl.com   (x6)
+  entrust.net   (x6)
+  xiaozhi.me   (x3)
+  open-meteo.com   (x3)
+  fontawesome.com   (x3)
+  tenclass.net   (x2)
+  openfontlicense.org   (x2)
+  sil.org   (x2)
+  ntp.org   (x1)
+  folotoy.cn   (x1)
+  creativecommons.org   (x1)
+  godaddy.com   (x1)
+--- IPv4[:port] ---
+  192.168.4.1   (x3)
+  2.1.0.29   (x2)
+
+==============================================================================
+敏感关键字命中（值已截断，避免整段凭据刷屏）
+==============================================================================
+  aes              x88   例[factory]: TLS-ECDHE-ECDSA-WITH-AES-128-CBC-SHA
+  hmac             x11   例[factory]: ESP_ERR_HW_CRYPTO_DS_HMAC_FAIL
+  password         x9    例[factory]: ESP_ERR_WIFI_PASSWORD
+  token            x8    例[factory]: W (%lu) %s: token 
+  authorization    x8    例[factory]: : BLE_HS_EAUTHOR (Insufficient authorization)
+  secret           x3    例[factory]: DeviceSecret
+  passwd           x1    例[factory]: ap.passwd
+
+内嵌 TLS 证书: 1 张
+⚠ 发现非证书的 PEM 私钥块: 6 处（需重点核查）
+
+==============================================================================
+NVS 命名空间与键名（字符串值已脱敏，只给长度）
+==============================================================================
+[nvs]  命名空间: ['phy', 'trae_cfg', 'nimble_bond', 'misc', 'nvs.net80211', 'xiaozhi']
+   phy.cal_data               BLOB_IDX span=1
+   phy.cal_mac                BLOB_DATA span=2
+   phy.cal_mac                BLOB_IDX span=1
+   phy.cal_version            U32    span=1
+   trae_cfg.profile                BLOB_IDX span=1
+   nimble_bond.local_irk_1            BLOB_DATA span=2
+   nimble_bond.local_irk_1            BLOB_IDX span=1
+   nvs.net80211.ap.sndchan             U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.wifi_profiles          BLOB_IDX span=1
+   xiaozhi.uuid                   STR    len=  1  值=%
+   phy.cal_data               BLOB_IDX span=1
+   xiaozhi.wifi_profiles          BLOB_IDX span=1
+   phy.cal_data               BLOB_IDX span=1
+   phy.cal_data               BLOB_IDX span=1
+   xiaozhi.mqtt_cache_v1          BLOB_IDX span=1
+   phy.cal_data               BLOB_IDX span=1
+   phy.cal_data               BLOB_IDX span=1
+   phy.cal_data               BLOB_IDX span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+   xiaozhi.avatar                 U8     span=1
+[cardid]  命名空间: ['folotoy-key']
+   folotoy-key.DeviceKey              STR    len=  1  值=*
+[netcfg] 未解析出条目
+
+==============================================================================
+私有分区内容探针（自定类型的数据区）
+==============================================================================
+[petart] 905216 bytes, 熵=7.59, 可读串 704 条
+    DHfWqM0
+    00.1."
+    "."1."
+    345633"
+    544""3""
+    "133"1
+    "1"6"1"
+    353361
+[companion] 1646592 bytes, 熵=7.83, 可读串 2889 条
+    %!%!E!
+    Q#9#9C9
+    MP_HSq
+    YCA#9C9
+    QC9#9#9
+    YC9#9C9
+    QCA#9#9
+    bdAC9C9
+[imgava] 131072 bytes, 熵=7.96, 可读串 249 条
+    xeXIfMM
+    avatar-01
+    avatar-02
+    &avatar-03
+    avatar-04
+    zavatar-05
+    avatar-06
+    avatar-07
+[theme_cache] 94208 bytes, 熵=-0.00, 可读串 0 条
+[imgframe] 155648 bytes, 熵=-0.00, 可读串 0 条
+[imgstore] 32768 bytes, 熵=-0.00, 可读串 0 条
+[imguser] 32768 bytes, 熵=-0.00, 可读串 0 条
+[audio] 81920 bytes, 熵=-0.00, 可读串 0 条

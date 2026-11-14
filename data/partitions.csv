@@ -1,0 +1,18 @@
+# Name,   Type, SubType,  Offset,   Size,     说明
+# 从设备 8MB flash 的 0x8000 处解出的产品固件分区表（FoloToy AI Passport / trae_card 2.1.0-xiaozhi.29）
+# 注意：没有 otadata / ota_0 / ota_1 —— 该设备不支持 OTA，只能 USB 烧录
+nvs,        data, nvs,      0x9000,   0x6000,   # Wi-Fi 配置、MQTT 凭据缓存（明文）
+phy_init,   data, phy,      0xF000,   0x1000,
+factory,    app,  factory,  0x10000,  0x2CE000, # 应用固件
+petart,     data, spiffs,   0x2DE000, 0xDD000,  # 宠物/角色素材包（带版本校验）
+companion,  data, spiffs,   0x3BB000, 0x192000, # 伙伴资源包
+imgava,     data, spiffs,   0x54D000, 0x20000,  # 头像图片
+assets,     data, spiffs,   0x56D000, 0xE6000,  # 通用素材
+theme_cache,data, spiffs,   0x653000, 0x17000,  # 主题缓存
+cardid,     data, nvs,      0x66A000, 0x4000,   # 卡密：folotoy-key（DeviceKey/Secret/ProductKey，明文）
+imgframe,   data, spiffs,   0x66E000, 0x26000,  # 图片帧
+imgstore,   data, spiffs,   0x694000, 0x8000,   # 图库
+imguser,    data, spiffs,   0x69C000, 0x8000,   # 用户上传图
+audio,      data, spiffs,   0x6A4000, 0x14000,  # 提示音
+netcfg,     data, nvs,      0x6BC000, 0x4000,   # 网络配网信息
+recovery,   data, spiffs,   0x6C0000, 0x140000, # 恢复固件/工厂备份（实测全 0xFF，为空）
