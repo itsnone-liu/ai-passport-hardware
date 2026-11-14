@@ -15,6 +15,7 @@
 #include "terminal_net.h"
 #include "terminal_audio.h"
 #include "terminal_auth.h"
+#include "terminal_pav1.h"
 #include "terminal_ui.h"
 
 #include <stdarg.h>
@@ -133,17 +134,19 @@ static void reply_status(const link_reply_t *to, int id) {
     const unsigned heap_min = (unsigned)esp_get_minimum_free_heap_size();
     const unsigned heap_blk =
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
+    char audio[192];
+    terminal_pav1_describe(audio, sizeof audio);
     reply_fmt(to, "{\"id\":%d,\"ok\":true,\"cmd\":\"status\",\"device_id\":\"%s\",\"battery\":%d,\"mv\":%d,"
                   "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld,"
                   "\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u,"
-                  "\"auth\":\"%s\",\"session\":\"%s\",\"audio_ready\":false,\"audio_port\":%d}\n",
+                  "\"auth\":\"%s\",\"session\":\"%s\",\"audio_port\":%d,%s}\n",
               id, terminal_auth_device_id(), soc, mv, terminal_ui_volume(), terminal_ui_brightness(),
               (long long)up, heap_now,
               heap_min, heap_blk,
               terminal_auth_authorized()
                   ? (terminal_auth_has_secret() ? "ok" : "none")
                   : (terminal_auth_handshaking() ? "pending" : "none"),
-              terminal_auth_session_id(), terminal_auth_audio_port());
+              terminal_auth_session_id(), terminal_auth_audio_port(), audio);
 }
 
 static void apply_volume(int value) {
@@ -216,6 +219,8 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         if (act == AUTH_ACT_READY) {
             // §6.4：ready 在 auth 成功之后才发，且只发给完成握手的这条通道。
             terminal_link_emit_net_ready();
+            // §3.3：认证成功后立即拨号音频通道，不在按键时再连。
+            terminal_pav1_start(terminal_net_host(), terminal_auth_audio_port());
             cJSON_Delete(root);
             return;
         }
@@ -340,6 +345,19 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
             reply_fmt(reply,
                       "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.audio_selftest\",\"err\":\"%s\"}\n",
                       id, esp_err_to_name(err));
+        }
+    } else if (strcmp(c, "vendor.uplink_test") == 0) {
+        // 厂商扩展：往音频通道推一段 1 kHz 正弦，用来验证对端切帧边界是否正确。
+        // 由通道任务节拍发送（不在 USB 任务里阻塞），结果用 uplink_test 事件回报。
+        const uint32_t frames = (uint32_t)int_field(root, "frames", 25);
+        const uint32_t tone = (uint32_t)int_field(root, "tone_hz", 1000);
+        if (terminal_pav1_request_uplink_test(frames, tone)) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.uplink_test\",\"frames\":%u}\n",
+                      id, (unsigned)frames);
+        } else {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.uplink_test\",\"err\":\"not_supported\"}\n",
+                      id);
         }
     } else {
         reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"err\":\"unknown_cmd\"}\n", id);

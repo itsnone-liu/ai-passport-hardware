@@ -19,6 +19,7 @@
 #include "nvs_flash.h"
 #include "terminal_link.h"
 #include "terminal_auth.h"
+#include "terminal_pav1.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -154,6 +155,7 @@ static void backoff(void) {
 static void link_lost(const char *why) {
     const int64_t lived = (s_conn_us > 0) ? (esp_timer_get_time() - s_conn_us) : 0;
     terminal_auth_reset();  // session_id 随连接一起作废（§7.4）
+    terminal_pav1_stop();   // 控制通道没了，音频会话也失去归属（§3.3）
     drop_link(why);
     if (lived > LINK_OK_US) {
         s_retry_ms = RETRY_MS;  // 曾经用通过，回到快速重拨
@@ -553,6 +555,9 @@ void terminal_net_describe(char *buf, size_t n) {
     snprintf(buf, n, "\"ssid\":\"%s\",\"host\":\"%s\",\"port\":%d,\"password_set\":%s", ssid, host,
              s_port, (s_password[0] != '\0') ? "true" : "false");
 }
+
+const char *terminal_net_host(void) { return s_host; }
+int terminal_net_port(void) { return s_port; }
 
 // 扫描周边 AP，用于现场诊断"为什么连不上"：芯片只支持 2.4 GHz，5 GHz-only 的 SSID
 // 在这里根本不会出现。

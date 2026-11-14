@@ -26,6 +26,13 @@ int terminal_auth_provision(const char *secret, const char *device_id_override,
 // USB 救援：清掉已 provision 的密钥（回到兼容模式）。仅 USB 通道可用。
 bool terminal_auth_clear(void);
 
+// 音频通道用：新的随机 nonce（bytes 字节 → bytes*2 字符小写 hex）。
+void terminal_auth_random_hex(char *out, size_t bytes);
+
+// 音频通道的 audio_mac = HMAC-SHA256(secret, "PAV1AUTH|audio|<device_id>|<dev>|<srv>")。
+// 密钥不离开本文件；调用方只拿到十六进制摘要。
+bool terminal_auth_audio_mac(const char *device_nonce, const char *server_nonce, char out[65]);
+
 // 开始一次会话握手：生成 device_nonce 并把 hello 行写进 out。
 bool terminal_auth_begin(char *out, size_t cap);
 

@@ -39,6 +39,10 @@ void terminal_net_kill(const char *why);
 // 把当前配置写成 JSON 片段（不含密码），形如 "ssid":"..","host":"..","port":8080
 void terminal_net_describe(char *buf, size_t n);
 
+// 音频通道要用同一台服务器，所以这两个只读 getter 必须存在（端口由 hello 应答另给）。
+const char *terminal_net_host(void);
+int terminal_net_port(void);
+
 // 扫描周边 AP，写成 JSON 数组（最多 12 个，按信号排序）。成功返回 ESP_OK。
 // 注意：扫描会短暂断开当前连接，之后由重连逻辑自动恢复。
 esp_err_t terminal_net_scan(char *buf, size_t n);

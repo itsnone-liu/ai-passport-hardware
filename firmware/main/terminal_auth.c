@@ -288,3 +288,16 @@ void terminal_auth_reset(void) {
     s_anon_ok = false;
     s_unauth_hits = 0;
 }
+
+void terminal_auth_random_hex(char *out, size_t bytes) {
+    uint8_t rnd[32];
+    if (bytes > sizeof rnd) bytes = sizeof rnd;
+    esp_fill_random(rnd, bytes);
+    hex_encode(rnd, bytes, out);
+}
+
+bool terminal_auth_audio_mac(const char *device_nonce, const char *server_nonce, char out[65]) {
+    char canon[160];
+    snprintf(canon, sizeof canon, "PAV1AUTH|audio|%s|%s|%s", s_dev_id, device_nonce, server_nonce);
+    return hmac_hex(canon, out);
+}

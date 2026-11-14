@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "terminal_link.h"
 #include "terminal_auth.h"
+#include "terminal_pav1.h"
 #include "terminal_net.h"
 #include "terminal_proto.h"
 #include "terminal_ui.h"
@@ -110,6 +111,7 @@ void app_main(void) {
     terminal_link_init();
     terminal_net_preload();  // 配置先于 USB 通道就绪，避免开机瞬间 get_net 答空值
     terminal_auth_init();    // 设备 id 与密钥：必须在第一次握手之前就绪
+    terminal_pav1_init();    // 音频通道任务（等 auth 通过后才会真连）
 
     bsp_i2c_init();
     bsp_i2c_scan();
