@@ -120,6 +120,16 @@ static void send_hello(void) {
 // 下行重排窗：4 块 = 80 ms。上行实测 142 块里有 1 块乱序，按到达顺序播会把
 // 相邻两个 20 ms 块调个位置——不是静音也不是爆音，是音节内部错位，很难查。
 // 窗口小是有意的：等太久会吃掉播放环的余量，80 ms 足够盖住这条链路的抖动。
+static void win_push(uint32_t turn, uint32_t seq, const uint8_t *blk);
+
+// 下行前向纠错：3 块一组补 1 块奇偶（字节级 XOR）。
+// 为什么不是 NACK 重传：一个往返 200 ms，等回来那一块早就该播了；而播放环
+// 只有几百毫秒余量，重传窗口很窄。XOR 奇偶不需要往返——丢一块，奇偶块到的
+// 那一刻就能算出来。代价是 +33% 带宽（8.4 → 11.2 KB/s，链路实测上限 18.7）。
+// 丢两块就救不回来，那种情况记 norecover 如实上报。
+#define FEC_GROUP 3
+#define PAV1_FLAG_FEC 0x01     // 头里的 flags 字节：这一包是奇偶块，不是音频
+
 #define DOWN_WIN 4
 static uint8_t s_win_blk[DOWN_WIN][ADPCM_BLOCK_BYTES];
 static uint32_t s_win_seq[DOWN_WIN];
@@ -129,6 +139,51 @@ static bool s_down_started;
 static uint32_t s_down_expected;
 static uint32_t s_down_turn;
 static uint32_t s_late, s_reorder, s_gap;
+static uint8_t s_fec_blk[FEC_GROUP][ADPCM_BLOCK_BYTES];
+static uint32_t s_fec_seq[FEC_GROUP];
+static bool s_fec_used[FEC_GROUP];
+static uint32_t s_parity, s_recovered, s_norecover;
+static uint32_t s_fec_turn;
+
+// 收到的音频块顺手存进组缓冲，等奇偶块来判丢。
+static void fec_remember(uint32_t turn, uint32_t seq, const uint8_t *blk) {
+    const int slot = (int)(seq % FEC_GROUP);
+    // 换组就丢弃上一组：等不到的奇偶块说明那组本来就没打算纠错。
+    if (s_fec_used[slot] && s_fec_seq[slot] != seq &&
+        (seq % FEC_GROUP) == 0) {
+        for (int i = 0; i < FEC_GROUP; i++) s_fec_used[i] = false;
+    }
+    memcpy(s_fec_blk[slot], blk, ADPCM_BLOCK_BYTES);
+    s_fec_seq[slot] = seq;
+    s_fec_used[slot] = true;
+    s_fec_turn = turn;
+}
+
+// 奇偶块到了：组里正好缺一块就重建它，按原 seq 塞回重排窗。
+static void fec_recover(uint32_t turn, uint32_t base, const uint8_t *parity) {
+    s_parity++;
+    uint8_t acc[ADPCM_BLOCK_BYTES];
+    memcpy(acc, parity, ADPCM_BLOCK_BYTES);
+    int missing = -1;
+    int present = 0;
+    for (int i = 0; i < FEC_GROUP; i++) {
+        const uint32_t want = base + (uint32_t)i;
+        if (s_fec_used[i] && s_fec_seq[i] == want) {
+            present++;
+            for (int k = 0; k < ADPCM_BLOCK_BYTES; k++) acc[k] ^= s_fec_blk[i][k];
+        } else {
+            missing = i;
+        }
+    }
+    if (present == FEC_GROUP) return;          // 齐了，奇偶块白来一趟（正常）
+    if (present != FEC_GROUP - 1 || missing < 0) {
+        s_norecover++;                          // 一次丢两块，救不回来
+        return;
+    }
+    (void)turn;
+    win_push(s_fec_turn, base + (uint32_t)missing, acc);
+    s_recovered++;
+}
 
 static void win_clear(void) {
     for (int i = 0; i < DOWN_WIN; i++) s_win_used[i] = false;
@@ -234,6 +289,12 @@ static void poll_rx(void) {
         }
         const uint32_t turn = rd32(buf + 8);
         const uint8_t *p = buf + UDP_HDR_LEN;
+        if (buf[5] & PAV1_FLAG_FEC) {
+            // 奇偶块：base 是这一组的第一块，载荷是组内三块的字节级 XOR。
+            fec_recover(turn, rd32(p), p + 4);
+            continue;
+        }
+        fec_remember(turn, rd32(p), p + 4);
         win_push(turn, rd32(p), p + 4);
     }
 }
@@ -333,10 +394,11 @@ int terminal_udp_diag(char *buf, size_t n) {
     return snprintf(buf, n,
              "\"udp_ready\":%s,\"udp_sent\":%u,\"udp_fail\":%u,\"udp_ack\":%u,"
              "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_badmac\":%u,\"udp_late\":%u,"
-             "\"udp_reorder\":%u,\"udp_gap\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
+             "\"udp_reorder\":%u,\"udp_gap\":%u,\"udp_parity\":%u,\"udp_recovered\":%u,\"udp_norecover\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
              terminal_udp_ready() ? "true" : "false", (unsigned)s_sent, (unsigned)s_fail,
              (unsigned)s_acks, (unsigned)s_hello, (unsigned)s_down, (unsigned)s_bad,
              (unsigned)s_badmac,
-             (unsigned)s_late, (unsigned)s_reorder, (unsigned)s_gap, s_slow ? "true" : "false",
+             (unsigned)s_late, (unsigned)s_reorder, (unsigned)s_gap, (unsigned)s_parity,
+             (unsigned)s_recovered, (unsigned)s_norecover, s_slow ? "true" : "false",
              s_last_errno, (long long)s_ack_ms);
 }
