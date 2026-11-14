@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import secrets
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
@@ -39,6 +40,25 @@ STATE_ERROR = "error"
 
 CONTROL_LINE_MAX_IN = pav1.CONTROL_LINE_MAX_IN
 SERVER_ID_BASE = 1000          # server-owned request ids live above device events
+
+
+def tune_socket(writer: asyncio.StreamWriter) -> None:
+    """Server-side keepalive, the mirror of the firmware fix.
+
+    Without it a device that loses Wi-Fi (no FIN, no RST) leaves a session that
+    the kernel considers alive for ~2 hours: the exact failure the Windows side
+    found on the device, seen from this side. 30 s idle + 3 x 10 s probes means a
+    dead peer is noticed inside about a minute.
+    """
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
 class ProtocolViolation(Exception):
@@ -778,6 +798,7 @@ class Service:
     async def _on_control(self, reader: asyncio.StreamReader,
                           writer: asyncio.StreamWriter) -> None:
         session: Optional[Session] = None
+        tune_socket(writer)
         try:
             first = await asyncio.wait_for(reader.readline(), timeout=self.cfg.hello_timeout)
             msg = json.loads(first.decode() or "{}")
@@ -846,6 +867,7 @@ class Service:
                         writer: asyncio.StreamWriter) -> None:
         session: Optional[Session] = None
         link: Optional[AudioLink] = None
+        tune_socket(writer)
         try:
             first = await asyncio.wait_for(reader.read(4096), timeout=self.cfg.hello_timeout)
             head = pav1.Framer().feed(first)

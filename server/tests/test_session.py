@@ -405,3 +405,37 @@ class TestAdminSocket(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(reply["ok"])
         self.assertEqual("no_session", reply["err"])
         self.assertIn(DEVICE, reply["devices"])
+
+
+class TestServerKeepalive(unittest.IsolatedAsyncioTestCase):
+    """A device that loses Wi-Fi sends no FIN; without keepalive we hang for hours."""
+
+    async def test_accepted_control_socket_gets_keepalive(self):
+        import socket as _socket
+        from server.service import tune_socket
+
+        held: dict = {}
+
+        async def handler(reader, writer):          # noqa: ARG001 - keep both alive
+            held["writer"] = writer
+
+        srv = await asyncio.start_server(handler, "127.0.0.1", 0)
+        port = srv.sockets[0].getsockname()[1]
+        client_reader, client_writer = await asyncio.open_connection("127.0.0.1", port)
+        for _ in range(100):
+            if "writer" in held:
+                break
+            await asyncio.sleep(0.01)
+        server_writer = held["writer"]
+
+        tune_socket(server_writer)
+        sock = server_writer.get_extra_info("socket")
+        self.assertEqual(1, sock.getsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE))
+        self.assertEqual(30, sock.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE))
+        self.assertEqual(10, sock.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL))
+        self.assertEqual(3, sock.getsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT))
+
+        client_writer.close()
+        server_writer.close()
+        srv.close()
+        await srv.wait_closed()
