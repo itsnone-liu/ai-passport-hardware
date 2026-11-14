@@ -200,6 +200,11 @@ class AudioLink:
             return
         with contextlib.suppress(OSError):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024)
+        # The kernel option is not enough: asyncio's transport keeps its own
+        # buffer (64 KB by default) and drain() only waits once *that* fills, so
+        # writes still return instantly and pacing keeps lying about delivery.
+        with contextlib.suppress(Exception):
+            self.writer.transport.set_write_buffer_limits(high=16 * 1024, low=4 * 1024)
 
     async def send_frame(self, kind: int, turn_id: int, payload: bytes = b"") -> None:
         if self.closed:
@@ -291,6 +296,7 @@ class Session:
         self.probe_end_frames = 0
         self._pace_t0: Optional[float] = None
         self._pace_log_t0: Optional[float] = None
+        self._max_send_block = 0.0
         self._pace_sent = 0.0
         self.probe_end_turn = 0
         self._probe_log_at = 0.0
@@ -646,15 +652,19 @@ class Session:
         self._pace_t0 = None
         self._pace_sent = 0.0
         self._pace_log_t0 = None
+        self._max_send_block = 0.0
         queue: asyncio.Queue = asyncio.Queue()
         producer_done = object()
 
         async def produce() -> None:
             try:
+                log.info("%s speak: asking brain for turn %d", self.device_id, turn_id)
                 async for chunk in self.service.brain.ask(m.text,
                                                           session=self.service.dsh_session):
                     if m.dsh_first_ms is None:
                         m.dsh_first_ms = self.service.now_ms()
+                        log.info("%s speak: first text chunk at +%d ms", self.device_id,
+                                 m.dsh_first_ms - m.speech_end_ms)
                     async for audio in self.service.tts.stream(chunk):
                         if self._cancel.is_set():
                             return
@@ -668,6 +678,8 @@ class Session:
         producer = asyncio.create_task(produce())
         try:
             first = await queue.get()
+            log.info("%s speak: first audio chunk %d B", self.device_id,
+                     len(first) if not isinstance(first, Exception) else -1)
             if isinstance(first, Exception):
                 raise first
             if first is producer_done:
@@ -690,6 +702,8 @@ class Session:
                     raise item
                 await self._write_audio(item, turn_id, m)
             await self.audio.send_frame(pav1.KIND_END, turn_id)
+            log.info("%s downlink done: %d bytes, worst send block %.0f ms",
+                     self.device_id, m.downlink_bytes, self._max_send_block * 1000)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(self._played_end.wait(),
                                        self.cfg.playback_tail_timeout)
@@ -724,7 +738,11 @@ class Session:
             frame = audio[off:off + step]
             if len(frame) < step and off + step > len(audio):
                 break               # partial tail is dropped, not padded into the speaker
+            t_send = asyncio.get_running_loop().time()
             await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)
+            blocked = asyncio.get_running_loop().time() - t_send
+            if blocked > self._max_send_block:
+                self._max_send_block = blocked
             if m.downlink_bytes == 0:
                 log.info("%s first PCM frame turn=%d len=%d", self.device_id, turn_id,
                          len(frame))
