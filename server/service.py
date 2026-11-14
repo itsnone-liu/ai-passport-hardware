@@ -175,11 +175,13 @@ class AudioLink:
     """One PAV1 audio connection: frames in both directions for one session."""
 
     def __init__(self, session: "Session", reader: asyncio.StreamReader,
-                 writer: asyncio.StreamWriter):
+                 writer: asyncio.StreamWriter, framer: Optional[pav1.Framer] = None):
         self.session = session
         self.reader = reader
         self.writer = writer
-        self.framer = pav1.Framer()
+        # Adopt the accept path's framer: it may already hold bytes of a frame
+        # that started in the same segment as the HELLO.
+        self.framer = framer if framer is not None else pav1.Framer()
         self.authed = False
         self.closed = False
         self._write_lock = asyncio.Lock()
@@ -953,29 +955,77 @@ class Service:
 
     async def _on_audio(self, reader: asyncio.StreamReader,
                         writer: asyncio.StreamWriter) -> None:
+        """Accept an audio channel: read the HELLO, then bind it to a session.
+
+        Three ways this used to end in a silent close, all of them seen on real
+        hardware: a HELLO split across TCP segments (one `read()` is not a
+        frame), a bogus session_id (the error reply was itself malformed, so it
+        raised before being sent), and a peer that connects and says nothing.
+        Silence is indistinguishable from "the server is not there", so every
+        exit here now says something first.
+        """
         session: Optional[Session] = None
         link: Optional[AudioLink] = None
+        framer = pav1.Framer()
         tune_socket(writer)
+
+        def reply(err: str, ok: bool = False) -> None:
+            with contextlib.suppress(Exception):
+                writer.write(pav1.encode_json_frame(
+                    pav1.KIND_HELLO, 0, {"ok": ok, "err": err}))
+
         try:
-            first = await asyncio.wait_for(reader.read(4096), timeout=self.cfg.hello_timeout)
-            head = pav1.Framer().feed(first)
-            if not head or head[0].kind != pav1.KIND_HELLO:
-                writer.close()
-                return
-            obj = head[0].json() or {}
-            session = self.by_session_id.get(str(obj.get("session_id", "")))
-            if session is None:
-                writer.write(pav1.encode_json_frame(pav1.KIND_HELLO,
-                                                    {"ok": False, "err": "session_mismatch"}))
+            # Collect until a whole frame is available; TCP may split the header
+            # from the payload, which is exactly how the first HELLO was lost.
+            head: Optional[pav1.Frame] = None
+            rest: list[pav1.Frame] = []
+            deadline = asyncio.get_running_loop().time() + self.cfg.hello_timeout
+            while head is None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    reply("timeout")
+                    await writer.drain()
+                    writer.close()
+                    return
+                try:
+                    chunk = await asyncio.wait_for(reader.read(4096), remaining)
+                except asyncio.TimeoutError:
+                    reply("timeout")
+                    await writer.drain()
+                    writer.close()
+                    return
+                if not chunk:
+                    writer.close()          # peer left before saying anything
+                    return
+                try:
+                    frames = framer.feed(chunk)
+                except pav1.Pav1Error as exc:
+                    reply(exc.code.lower())
+                    await writer.drain()
+                    writer.close()
+                    return
+                if frames:
+                    head, rest = frames[0], frames[1:]
+
+            if head.kind != pav1.KIND_HELLO:
+                reply("bad_frame")
                 await writer.drain()
                 writer.close()
                 return
+
+            obj = head.json() or {}
+            session = self.by_session_id.get(str(obj.get("session_id", "")))
+            if session is None:
+                reply("session_mismatch")
+                await writer.drain()
+                writer.close()
+                return
+
             if session.audio is not None:
-                # One audio channel per session: the newest one wins, the old one
-                # is dropped, otherwise a reconnect would leave two clients
-                # competing for the same speaker.
+                # One audio channel per session: the newest wins, because after a
+                # reconnect two clients must not compete for the same speaker.
                 await session.audio.close()
-            link = AudioLink(session, reader, writer)
+            link = AudioLink(session, reader, writer, framer=framer)
             session.audio = link
             try:
                 await session.on_audio_hello(link, obj)
@@ -983,11 +1033,9 @@ class Service:
                 await link.send_json(pav1.KIND_HELLO, {"ok": False, "err": str(exc)})
                 await link.close()
                 return
-            # Feed the same bytes through the live link's framer so any trailing
-            # partial frame in this packet is kept, not silently discarded.
-            for frame in link.framer.feed(first):
-                if frame.kind == pav1.KIND_HELLO:
-                    continue
+            # Frames that arrived in the same packet as the HELLO (an AUTH frame
+            # sent eagerly) still belong to this link.
+            for frame in rest:
                 await link._handle(frame)
             await link.read_loop()
         except asyncio.TimeoutError:

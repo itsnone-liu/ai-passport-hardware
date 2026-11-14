@@ -524,3 +524,77 @@ class TestDevAudioProbe(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, session.probe_frames)
         await dev.close()
         await svc.stop()
+
+
+class TestAudioChannelAccept(unittest.IsolatedAsyncioTestCase):
+    """The audio handshake must survive TCP segmentation and always answer.
+
+    Three real failures on hardware, all silent: a HELLO split across segments
+    (one read() is not a frame), a bogus session_id (the refusal itself was
+    malformed and raised before sending), and a connect-and-say-nothing peer.
+    """
+
+    async def asyncSetUp(self):
+        self.svc = await make_service()
+        self.dev = MockPassport("127.0.0.1", self.svc.control_port, DEVICE, SECRET)
+        await self.dev.connect()
+        self.session = self.svc.session_of(DEVICE)
+
+    async def asyncTearDown(self):
+        await self.dev.close()
+        await self.svc.stop()
+
+    def _hello_frame(self, session_id: str) -> bytes:
+        import server.pav1 as pav1
+        payload = json.dumps({"device_id": DEVICE, "proto": "v1",
+                              "session_id": session_id, "nonce": "a" * 32}).encode()
+        return pav1.encode_frame(pav1.KIND_HELLO, 0, payload)
+
+    async def test_hello_split_across_segments_is_accepted(self):
+        import server.pav1 as pav1
+        frame = self._hello_frame(self.session.session_id)
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.svc.audio_port)
+        writer.write(frame[:16])                     # header first
+        await writer.drain()
+        await asyncio.sleep(0.05)
+        writer.write(frame[16:])                     # payload in a second segment
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(4096), 3)
+        self.assertTrue(data, "a split HELLO must not be answered with silence")
+        ack = pav1.Framer().feed(data)[0].json()
+        self.assertTrue(ack["ok"])
+        self.assertIn("server_nonce", ack)
+        writer.close()
+
+    async def test_unknown_session_gets_a_parseable_refusal(self):
+        import server.pav1 as pav1
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.svc.audio_port)
+        writer.write(self._hello_frame("deadbeefdeadbeef"))
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(4096), 3)
+        self.assertTrue(data, "a refusal must still be a message")
+        frame = pav1.Framer().feed(data)[0]
+        obj = frame.json()
+        self.assertFalse(obj["ok"])
+        self.assertEqual("session_mismatch", obj["err"])
+        writer.close()
+
+    async def test_silent_peer_gets_a_timeout_reply(self):
+        import server.pav1 as pav1
+        self.svc.cfg.hello_timeout = 0.5
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.svc.audio_port)
+        data = await asyncio.wait_for(reader.read(4096), 3)
+        self.assertTrue(data, "connecting and saying nothing must not be met with silence")
+        obj = pav1.Framer().feed(data)[0].json()
+        self.assertEqual("timeout", obj["err"])
+        writer.close()
+
+    async def test_garbage_hello_is_reported_not_swallowed(self):
+        import server.pav1 as pav1
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.svc.audio_port)
+        writer.write(b"XXXX" + b"\x00" * 32)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(4096), 3)
+        self.assertTrue(data)
+        self.assertEqual("bad_magic", pav1.Framer().feed(data)[0].json()["err"])
+        writer.close()
