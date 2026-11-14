@@ -25,6 +25,10 @@ USB 枚举 → 8 MB flash 全量备份 → 固件与分区分析 → 安全评�
 ```
 docs/
   research-notes.md        完整调研笔记（10 节，含所有命令与踩坑）
+  terminal-firmware.md     薄终端固件设计（任务/协议/状态机）
+  capture-uplink.md        采集上行：帧路径、堆预算实测、服务端契约
+  xiaozhi-patterns.md      上游小智音频架构对照：可借经验与本机取舍
+  next-plan-opus-udp.md    下一步方案（Opus + 队列语义 + UDP 音频）
 data/
   partitions.csv           产品固件分区表（从 flash 解出）
   usb-identity.md          USB 枚举 / 芯片 / flash 识别
