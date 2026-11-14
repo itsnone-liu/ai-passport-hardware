@@ -33,6 +33,9 @@ esp_err_t terminal_net_set(const char *ssid, const char *password, const char *h
 // 按当前参数断开并重新连接（Wi-Fi 未初始化时为空操作）。
 void terminal_net_reconnect(void);
 
+// 让 net_task 主动弃掉当前会话（认证失败/被拒次数超限）。不在调用方上下文里关 fd。
+void terminal_net_kill(const char *why);
+
 // 把当前配置写成 JSON 片段（不含密码），形如 "ssid":"..","host":"..","port":8080
 void terminal_net_describe(char *buf, size_t n);
 

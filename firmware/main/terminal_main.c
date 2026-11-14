@@ -13,6 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "terminal_link.h"
+#include "terminal_auth.h"
 #include "terminal_net.h"
 #include "terminal_proto.h"
 #include "terminal_ui.h"
@@ -108,6 +109,7 @@ void app_main(void) {
     ESP_LOGI(TAG, "dsh terminal 启动");
     terminal_link_init();
     terminal_net_preload();  // 配置先于 USB 通道就绪，避免开机瞬间 get_net 答空值
+    terminal_auth_init();    // 设备 id 与密钥：必须在第一次握手之前就绪
 
     bsp_i2c_init();
     bsp_i2c_scan();

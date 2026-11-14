@@ -24,10 +24,22 @@ typedef struct {
 } link_reply_t;
 
 void terminal_link_init(void);
-void terminal_link_register(link_sink_t sink);
+void terminal_link_register(link_src_t src, link_sink_t sink);
 
 // 广播给所有已注册的载体：只用于 ready/key/error 这类事件。
 void terminal_link_send(const char *line);
+
+// 只发给某一个载体（例如握手只能走 TCP 会话，不该在 USB 上出现）。
+void terminal_link_send_src(link_src_t src, const char *line);
+
+// 网络会话建链后调用：生成 nonce、把 hello 发到 TCP 通道。应答由 dispatch 处理。
+void terminal_link_start_net_session(void);
+
+// 握手完成（或退化兼容）后发 ready。§6.4：ready 只能在认证之后发。
+void terminal_link_emit_net_ready(void);
+
+// 握手期间被拒的次数超过阈值时，让 net 侧主动断链（协议 §3.2：三次关连接）。
+void terminal_link_kill_net_session(void);
 
 // 解析并执行一行（调用方负责去掉行尾）。应答只回 reply->sink，不广播——USB 与 TCP
 // 同时在线时广播会让两边都收到对方的应答，id 还会撞车。

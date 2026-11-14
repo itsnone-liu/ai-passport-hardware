@@ -18,6 +18,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "terminal_link.h"
+#include "terminal_auth.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -152,6 +153,7 @@ static void backoff(void) {
 // 2.4 s 一轮的永久快循环，把重试预算全烧在一条坏链路上。
 static void link_lost(const char *why) {
     const int64_t lived = (s_conn_us > 0) ? (esp_timer_get_time() - s_conn_us) : 0;
+    terminal_auth_reset();  // session_id 随连接一起作废（§7.4）
     drop_link(why);
     if (lived > LINK_OK_US) {
         s_retry_ms = RETRY_MS;  // 曾经用通过，回到快速重拨
@@ -326,7 +328,7 @@ static void net_task(void *arg) {
                 s_last_rx_us = esp_timer_get_time();
                 s_conn_us = s_last_rx_us;
                 ESP_LOGI(TAG, "已连上服务器 %s:%d", s_host, s_port);
-                terminal_link_send("{\"event\":\"ready\",\"link\":\"net\"}\n");
+                terminal_link_start_net_session();  // 握手：先 hello，认证通过后才由 dispatch 发 ready
             } else {
                 backoff();
             }
@@ -347,6 +349,13 @@ static void net_task(void *arg) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             // 2 s 无数据是正常的；长时间完全静默说明这条流已经死了（NAT 超时、对端僵死），
             // 这种连接不会自己恢复，只能弃掉重拨。
+            const auth_act_t act = terminal_auth_tick_step();
+            if (act == AUTH_ACT_READY) {
+                terminal_link_emit_net_ready();
+            } else if (act == AUTH_ACT_FAILED || terminal_auth_failed()) {
+                link_lost("auth failed");
+                continue;
+            }
             if (esp_timer_get_time() - s_last_rx_us > IDLE_DROP_S * 1000000LL) {
                 link_lost("idle timeout");
             }
@@ -434,7 +443,7 @@ esp_err_t terminal_net_start(void) {
     wc.sta.threshold.authmode = (s_password[0] != '\0') ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
 
-    terminal_link_register(tcp_sink);
+    terminal_link_register(LINK_SRC_TCP, tcp_sink);
 
     if (xTaskCreate(net_task, "dsh_net", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -480,6 +489,12 @@ void terminal_net_reconnect(void) {
     drop_link("reconfigured");
     wifi_apply_sta();
     ESP_LOGI(TAG, "网络参数已更新: ssid=\"%s\" server=%s:%d", s_ssid, s_host, s_port);
+}
+
+void terminal_net_kill(const char *why) {
+    // 只置标志：真正的 close 由 net_task 做，避免在两个任务里同时动 fd 与锁。
+    ESP_LOGW(TAG, "主动弃掉当前会话：%s", why ? why : "?");
+    s_link_dead = true;
 }
 
 esp_err_t terminal_net_apply(const char *ssid, const char *password, const char *host, int port) {

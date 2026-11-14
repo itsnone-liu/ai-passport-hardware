@@ -47,7 +47,9 @@ static void proto_task(void *arg) {
                 if (discard) {
                     // 静默丢掉半截命令会让主机以为命令生效了；明确告诉它太长。
                     discard = false;
-                    terminal_link_send("{\"ok\":false,\"err\":\"line_too_long\"}\n");
+                    // 这也是应答，只回 USB（该行本来就来自 USB），不走广播。
+                    const size_t m = strlen("{\"ok\":false,\"err\":\"line_too_long\"}\n");
+                    usb_sink("{\"ok\":false,\"err\":\"line_too_long\"}\n", m);
                 } else {
                     line[len] = '\0';
                     if (len > 0) {
@@ -83,7 +85,7 @@ esp_err_t terminal_proto_start(void) {
     }
 
     s_ready = true;
-    terminal_link_register(usb_sink);
+    terminal_link_register(LINK_SRC_USB, usb_sink);
 
     if (xTaskCreate(proto_task, "dsh_usb", 4096, NULL, 6, NULL) != pdPASS) {
         s_ready = false;
