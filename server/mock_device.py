@@ -175,7 +175,8 @@ class MockPassport:
         return await asyncio.wait_for(fut, timeout=timeout)
 
     async def _reply(self, msg: dict, **fields) -> None:
-        out = {"id": msg.get("id", 0), "ok": True, "cmd": msg.get("cmd")}
+        cmd = fields.pop("cmd", msg.get("cmd"))
+        out = {"id": msg.get("id", 0), "ok": True, "cmd": cmd}
         out.update(fields)
         assert self.control_writer is not None
         self.control_writer.write((json.dumps(out, separators=(",", ":")) + "\n").encode())
@@ -218,6 +219,9 @@ class MockPassport:
             await self._reply(msg, brightness=value)
         elif cmd == "show_text":
             await self._reply(msg)
+        elif cmd == "ping":
+            # Protocol §6.1: the reply's cmd is "pong", not an echo of "ping".
+            await self._reply(msg, cmd="pong")
         elif cmd == "get_status":
             await self._reply(msg, battery=94, mv=4120, volume=60, brightness=80, uptime=1,
                               # real board numbers after a full boot: these are

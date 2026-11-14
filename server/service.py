@@ -665,13 +665,21 @@ class Service:
 
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
-        self._servers.append(await asyncio.start_server(
-            self._on_control, self.cfg.host, self.cfg.control_port))
-        self.control_port = self._servers[-1].sockets[0].getsockname()[1]
+        # Keep each server's own socket: reading self._servers[-1] after a later
+        # bind silently reported the wrong port (the admin socket), which made
+        # every client connect to the wrong listener.
+        control_srv = await asyncio.start_server(
+            self._on_control, self.cfg.host, self.cfg.control_port)
+        self._servers.append(control_srv)
+        self.control_port = control_srv.sockets[0].getsockname()[1]
         if self.audio_enabled:
+            audio_srv = await asyncio.start_server(
+                self._on_audio, self.cfg.host, self.cfg.audio_port)
+            self._servers.append(audio_srv)
+            self.audio_port = audio_srv.sockets[0].getsockname()[1]
+        if self.cfg.admin_port:
             self._servers.append(await asyncio.start_server(
-                self._on_audio, self.cfg.host, self.cfg.audio_port))
-            self.audio_port = self._servers[-1].sockets[0].getsockname()[1]
+                self._on_admin, "127.0.0.1", self.cfg.admin_port))
         log.info("control on %s:%d audio on %s:%d", self.cfg.host, self.control_port,
                  self.cfg.host, self.audio_port)
 
@@ -681,6 +689,90 @@ class Service:
             with contextlib.suppress(Exception):
                 await srv.wait_closed()
         self._servers.clear()
+
+    async def send_raw(self, device_id: str, obj: Dict[str, Any],
+                       timeout: float = 20.0) -> Dict[str, Any]:
+        """Write an arbitrary control line to a device and wait for its reply.
+
+        The id in `obj` is preserved on purpose: a test that checks
+        request/response routing has to assert the same id came back, so the
+        server must not renumber it.
+        """
+        session = self.sessions.get(device_id)
+        if session is None or session.control is None:
+            raise KeyError(f"no live control session for {device_id}")
+        link = session.control
+        rid = obj.get("id")
+        if rid is None:
+            raise ValueError("admin send requires an explicit id")
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        link.pending[rid] = fut
+        try:
+            await link.send(obj)
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            link.pending.pop(rid, None)
+
+    async def _on_admin(self, reader: asyncio.StreamReader,
+                        writer: asyncio.StreamWriter) -> None:
+        """Localhost admin: one JSON object per line, one reply per line.
+
+        Deliberately dumb and local-only. Anything that can reach this socket can
+        drive a speaker in someone's room, so it binds 127.0.0.1 and never speaks
+        over the network.
+        """
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                try:
+                    req = json.loads(line)
+                except json.JSONDecodeError:
+                    writer.write(b'{"ok":false,"err":"bad_json"}\n')
+                    await writer.drain()
+                    continue
+                resp = await self._admin_handle(req)
+                writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode())
+                await writer.drain()
+        except (ConnectionResetError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    async def _admin_handle(self, req: Dict[str, Any]) -> Dict[str, Any]:
+        op = req.get("op")
+        try:
+            if op == "list":
+                return {"ok": True, "sessions": [{
+                    "device_id": s.device_id, "session_id": s.session_id,
+                    "state": s.state, "turn_id": s.active_turn, "authed": s.authed,
+                    "audio": bool(s.audio and s.audio.authed),
+                    "control_open": bool(s.control and not s.control.closed),
+                    "turns_done": len(s.metrics),
+                } for s in self.sessions.values()]}
+            if op == "send":
+                payload = req.get("json") or {}
+                reply = await self.send_raw(str(req.get("device", "")), payload,
+                                            timeout=float(req.get("timeout", 20)))
+                return {"ok": True, "reply": reply}
+            if op == "show":
+                session = self.sessions[str(req.get("device", ""))]
+                return {"ok": True, "reply": await session.show_text(str(req.get("text", "")))}
+            if op == "speak":
+                session = self.sessions[str(req.get("device", ""))]
+                await session.speak_notification(str(req.get("text", "")))
+                return {"ok": True}
+            return {"ok": False, "err": "unknown_op", "op": op}
+        except KeyError as exc:
+            return {"ok": False, "err": "no_session", "detail": str(exc),
+                    "devices": list(self.sessions)}
+        except asyncio.TimeoutError:
+            return {"ok": False, "err": "timeout"}
+        except Exception as exc:                      # noqa: BLE001 - admin must answer
+            log.exception("admin op failed")
+            return {"ok": False, "err": "internal", "detail": str(exc)}
 
     # -- connection handlers ----------------------------------------------
     async def _on_control(self, reader: asyncio.StreamReader,

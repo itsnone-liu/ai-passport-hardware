@@ -43,6 +43,10 @@ class Config:
     dsh_binary: str = "dsh"
     dsh_profile: str = "headless"
 
+    # Localhost-only admin socket (JSONL): list sessions, send a raw command to a
+    # device, push show_text/speak. 0 disables it. Never bind this publicly.
+    admin_port: int = 0
+
     # Compatibility escape hatch (protocol §11): accept a control connection that
     # never says hello, i.e. firmware from before W2-2. Dev only -- anonymous
     # sessions get no audio and are logged loudly. Never enable on a public host.

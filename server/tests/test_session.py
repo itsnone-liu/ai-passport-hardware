@@ -354,3 +354,54 @@ class TestLegacyFirmwareCompat(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("hello_required", reply["err"])
         writer.close()
         await svc.stop()
+
+
+class TestAdminSocket(unittest.IsolatedAsyncioTestCase):
+    """The admin socket is how a human drives a device; it must stay local-only."""
+
+    async def asyncSetUp(self):
+        import socket as _s
+        with _s.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            self.admin_port = probe.getsockname()[1]
+        self.svc = await make_service(admin_port=self.admin_port)
+        self.dev = MockPassport("127.0.0.1", self.svc.control_port, DEVICE, SECRET)
+        await self.dev.connect()
+
+    async def asyncTearDown(self):
+        await self.dev.close()
+        await self.svc.stop()
+
+    async def _admin(self, req):
+        import socket
+        loop = asyncio.get_running_loop()
+
+        def run():
+            with socket.create_connection(("127.0.0.1", self.admin_port), timeout=10) as s:
+                s.sendall((json.dumps(req) + "\n").encode())
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                return json.loads(buf)
+
+        return await loop.run_in_executor(None, run)
+
+    async def test_list_and_send_preserve_the_request_id(self):
+        listed = await self._admin({"op": "list"})
+        self.assertTrue(listed["ok"])
+        self.assertEqual(DEVICE, listed["sessions"][0]["device_id"])
+        reply = await self._admin({"op": "send", "device": DEVICE,
+                                   "json": {"id": 900, "cmd": "ping"}})
+        self.assertTrue(reply["ok"])
+        self.assertEqual(900, reply["reply"]["id"], "admin must not renumber ids")
+        self.assertEqual("pong", reply["reply"]["cmd"])
+
+    async def test_send_to_unknown_device_reports_available_ones(self):
+        reply = await self._admin({"op": "send", "device": "nope",
+                                   "json": {"id": 1, "cmd": "ping"}})
+        self.assertFalse(reply["ok"])
+        self.assertEqual("no_session", reply["err"])
+        self.assertIn(DEVICE, reply["devices"])
