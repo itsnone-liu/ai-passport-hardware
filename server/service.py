@@ -1479,6 +1479,22 @@ class Service:
                                                       self.cfg.request_timeout, turn_id=turn)
                 return {"ok": True, "turn_id": turn, "frames": n,
                         "udp_frames": session.down_udp_frames}
+            if op == "replay_old":
+                # 用活连接把一段旧轮次原样重放：turn 在 MAC 覆盖范围内，攻击者
+                # 改不了，只能照原样再放一遍。设备端若把 turn 做成单调，就应当
+                # 全部拒绝（udp_staleturn 增加、udp_down 不变）。
+                session = self.sessions.get(req.get("device", ""))
+                if session is None or session.udp_peer is None:
+                    return {"ok": False, "err": "no session"}
+                import struct as _struct
+                old = int(req.get("turn_id", 0))
+                blk = bytes(164)
+                sent = 0
+                for seq in range(int(req.get("frames", 5))):
+                    payload = _struct.pack("<I", seq) + blk
+                    if session._sign_send(old, payload, 0):
+                        sent += 1
+                return {"ok": True, "turn_id": old, "sent": sent}
             if op == "push_frames":
                 # Bench aid: push raw PAV1 frames with no playback.start, so the
                 # device can be measured reading the socket in isolation.
