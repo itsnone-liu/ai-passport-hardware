@@ -394,10 +394,14 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         }
     } else if (strcmp(c, "get_audio") == 0) {
         char audio[224];
-        char play[256];
+        char play[320];
         terminal_capture_get_audio(audio, sizeof audio);
         terminal_playback_describe(play, sizeof play);
-        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"get_audio\",%s,%s}\n", id, audio, play);
+        reply_fmt(reply,
+                  "{\"id\":%d,\"ok\":true,\"cmd\":\"get_audio\",\"audio_rx_frames\":%u,"
+                  "\"audio_rx_end\":%u,\"audio_tx_frames\":%u,%s,%s}\n",
+                  id, terminal_pav1_rx_frames(), terminal_pav1_rx_end(), terminal_pav1_tx_frames(),
+                  audio, play);
     } else if (strcmp(c, "state.set") == 0) {
         const cJSON *st = cJSON_GetObjectItemCaseSensitive(root, "state");
         static const char *k_states[] = {"idle", "listening", "processing", "speaking", "error"};
@@ -438,13 +442,25 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
             reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"playback.stop\",\"err\":\"turn_closed\"}\n",
                       id);
         }
+    } else if (strcmp(c, "vendor.i2s_pace") == 0) {
+        const int frames = int_field(root, "frames", 100);
+        const esp_err_t err = terminal_audio_pace_test(frames);
+        if (err == ESP_OK) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.i2s_pace\",\"frames\":%d}\n", id,
+                      frames);
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.i2s_pace\",\"err\":\"busy\"}\n", id);
+        }
     } else if (strcmp(c, "vendor.playback_selftest") == 0) {
         // 走真环/真任务/真 I2S，只是不经过网络：先把播放状态机验干净再接入对端。
         const int ms = int_field(root, "ms", 2000);
-        const esp_err_t err = terminal_playback_selftest(ms);
+        const int speed = int_field(root, "speed", 1);
+        const esp_err_t err = terminal_playback_selftest(ms, speed);
         if (err == ESP_OK) {
             reply_fmt(reply,
-                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.playback_selftest\",\"ms\":%d}\n", id, ms);
+                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.playback_selftest\",\"ms\":%d,"
+                      "\"speed\":%d}\n",
+                      id, ms, speed);
         } else {
             reply_fmt(reply,
                       "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.playback_selftest\",\"err\":\"busy\"}\n", id);

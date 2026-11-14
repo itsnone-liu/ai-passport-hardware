@@ -26,4 +26,4 @@ void terminal_playback_mark_end(uint32_t turn_id);
 void terminal_playback_describe(char *buf, size_t n);
 
 // 厂商自测：按服务端节奏把正弦推进播放环，走真环/真任务/真 I2S。
-esp_err_t terminal_playback_selftest(int ms);
+esp_err_t terminal_playback_selftest(int ms, int speed);

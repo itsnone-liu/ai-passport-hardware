@@ -208,6 +208,46 @@ static void tone_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// 测 bsp_audio_write 到底会不会阻塞：连续写 N 帧静音，量总耗时。
+// 若耗时 ≈ N×20 ms → 写操作被 I2S 时钟节流（可以依赖它当节拍）；
+// 若明显更短 → 驱动只是把数据拷进内部缓冲就返回（不能依赖它当节拍）。
+static void pace_task(void *arg) {
+    const int frames = (int)(intptr_t)arg;
+    static int16_t silence[320];
+    bsp_audio_set_format(SAMPLE_HZ, 16, 1);
+    int64_t t_first_done = 0;
+    const int64_t t0 = esp_timer_get_time();
+    for (int i = 0; i < frames; i++) {
+        bsp_audio_write(silence, sizeof silence);
+        if (i == 0) t_first_done = esp_timer_get_time();
+    }
+    const int64_t t1 = esp_timer_get_time();
+    const int total_ms = (int)((t1 - t0) / 1000);
+    const int first_ms = (int)((t_first_done - t0) / 1000);
+    const int nominal = frames * 20;
+    ESP_LOGI(TAG, "写入节流测试: %d 帧（名义 %d ms）实际 %d ms，首帧 %d ms", frames, nominal,
+             total_ms, first_ms);
+    char ev[224];
+    snprintf(ev, sizeof ev,
+             "{\"event\":\"i2s_pace\",\"frames\":%d,\"nominal_ms\":%d,\"elapsed_ms\":%d,"
+             "\"first_frame_ms\":%d,\"ratio_pct\":%d}\n",
+             frames, nominal, total_ms, first_ms, nominal ? (total_ms * 100 / nominal) : 0);
+    terminal_link_send_src(LINK_SRC_USB, ev);
+    s_busy = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t terminal_audio_pace_test(int frames) {
+    if (s_busy) return ESP_ERR_INVALID_STATE;
+    if (frames <= 0 || frames > 400) return ESP_ERR_INVALID_ARG;
+    s_busy = true;
+    if (xTaskCreate(pace_task, "dsh_pace", 4096, (void *)(intptr_t)frames, 4, NULL) != pdPASS) {
+        s_busy = false;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 esp_err_t terminal_audio_tone_start(int ms, int hz) {
     if (s_busy) return ESP_ERR_INVALID_STATE;
     if (ms <= 0 || ms > 5000 || hz < 100 || hz > 8000) return ESP_ERR_INVALID_ARG;

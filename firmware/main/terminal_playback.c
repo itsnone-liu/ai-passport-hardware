@@ -37,12 +37,15 @@ static volatile uint32_t s_turn;
 static volatile bool s_input_ended;
 static volatile int64_t s_last_data_us;
 static volatile int64_t s_start_us;
+static int64_t s_next_frame_us;  // 下一帧的播放时刻（自走的播放时钟）
 
 static enum { PB_IDLE, PB_WAIT_FIRST, PB_PLAYING } s_state;
 static uint32_t s_played_frames;
 static uint32_t s_overflows;
 static uint32_t s_underruns;
 static uint32_t s_mismatch;
+// 帧为什么没进环：三种完全不同的原因，各自计数（混成一个数就只能靠猜）。
+static uint32_t s_rej_idle, s_rej_turn, s_rej_size, s_push_ok;
 static char s_state_txt[16] = "idle";
 
 static void emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -127,6 +130,7 @@ static void playback_task(void *arg) {
             xSemaphoreGive(s_mu);
             if (have >= PREBUF_FRAMES) {
                 s_state = PB_PLAYING;
+                s_next_frame_us = esp_timer_get_time();  // 播放时钟从"出声这一刻"起算
                 snprintf(s_state_txt, sizeof s_state_txt, "playing");
                 emit_started(s_turn);
                 continue;
@@ -144,6 +148,27 @@ static void playback_task(void *arg) {
         }
 
         // PB_PLAYING
+        // 播放时钟：每帧按 20 ms 推进，写操作快就等、慢就立刻追上。
+        // 不能只依赖 bsp_audio_write 阻塞——它现在确实阻塞（实测 150 帧名义 3000 ms、
+        // 实际 2930 ms），但一旦哪天驱动只把数据拷进内部缓冲就返回，环会被瞬间抽干，
+        // 表现为"起播后几百毫秒就 underrun"。节拍必须由自己掌握。
+        const int64_t now = esp_timer_get_time();
+        if (now < s_next_frame_us) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            if (s_input_ended) {
+                int have;
+                xSemaphoreTake(s_mu, portMAX_DELAY);
+                have = s_count;
+                xSemaphoreGive(s_mu);
+                if (have == 0) {
+                    emit_ended(s_turn, "completed");
+                    s_state = PB_IDLE;
+                    snprintf(s_state_txt, sizeof s_state_txt, "idle");
+                }
+            }
+            continue;
+        }
+
         xSemaphoreTake(s_mu, portMAX_DELAY);
         const bool got = pop_frame(frame);
         xSemaphoreGive(s_mu);
@@ -151,6 +176,9 @@ static void playback_task(void *arg) {
         if (got) {
             s_last_data_us = esp_timer_get_time();
             if (bsp_audio_write(frame, FRAME_BYTES) == ESP_OK) s_played_frames++;
+            s_next_frame_us += 20000;  // 20 ms/帧，与 §4 的帧长严格对应
+            const int64_t after = esp_timer_get_time();
+            if (s_next_frame_us < after) s_next_frame_us = after;  // 落后就追上，不补播
             continue;
         }
 
@@ -209,16 +237,19 @@ esp_err_t terminal_playback_stop(uint32_t turn_id) {
 
 bool terminal_playback_push(uint32_t turn_id, const void *pcm, size_t n) {
     if (s_state == PB_IDLE) {
-        s_mismatch++;  // 没人在播：这帧无人认领（§5.1 TURN_MISMATCH 语义，只计数）
+        s_mismatch++;
+        s_rej_idle++;  // 没人在播：这帧无人认领（§5.1 TURN_MISMATCH 语义，只计数）
         return false;
     }
     if (turn_id != s_turn) {
         s_mismatch++;
+        s_rej_turn++;  // 轮次不符：服务端推的是另一轮
         return false;
     }
     if (n != FRAME_BYTES) {
         // 下行也按 20 ms 一帧收；别的一律不猜怎么切（§4 只定了 20 ms）。
         s_mismatch++;
+        s_rej_size++;  // 帧长不对：640 B 之外不接受
         return false;
     }
     xSemaphoreTake(s_mu, portMAX_DELAY);
@@ -230,6 +261,7 @@ bool terminal_playback_push(uint32_t turn_id, const void *pcm, size_t n) {
         memcpy(s_ring[s_head], pcm, FRAME_BYTES);
         s_head = (s_head + 1) % RING_FRAMES;
         s_count++;
+        s_push_ok++;
         s_last_data_us = esp_timer_get_time();
     }
     xSemaphoreGive(s_mu);
@@ -251,10 +283,12 @@ void terminal_playback_describe(char *buf, size_t n) {
     xSemaphoreGive(s_mu);
     snprintf(buf, n,
              "\"play_state\":\"%s\",\"play_turn\":%u,\"ring_frames\":%d,\"ring_ms\":%d,"
-             "\"played\":%u,\"play_overflows\":%u,\"play_underruns\":%u,\"play_mismatch\":%u",
+             "\"played\":%u,\"play_overflows\":%u,\"play_underruns\":%u,\"play_mismatch\":%u,"
+             "\"push_ok\":%u,\"rej_idle\":%u,\"rej_turn\":%u,\"rej_size\":%u",
              s_state_txt, (unsigned)(s_state == PB_IDLE ? 0 : s_turn), have, have * 20,
              (unsigned)s_played_frames, (unsigned)s_overflows, (unsigned)s_underruns,
-             (unsigned)s_mismatch);
+             (unsigned)s_mismatch, (unsigned)s_push_ok, (unsigned)s_rej_idle, (unsigned)s_rej_turn,
+             (unsigned)s_rej_size);
 }
 
 // ---- 厂商自测：把正弦按服务端的节奏推进播放环 ----
@@ -263,29 +297,36 @@ void terminal_playback_describe(char *buf, size_t n) {
 #define SELFTEST_TURN 9001
 
 static void selftest_push_task(void *arg) {
-    const int frames = (int)(intptr_t)arg;
+    // 低 16 位 = 帧数，高 16 位 = 每 20 ms 推几帧（speed）。
+    const int frames = (int)((intptr_t)arg & 0xffff);
+    const int speed = (int)(((intptr_t)arg >> 16) & 0xffff);
     static int16_t pcm[FRAME_BYTES / 2];
     double phase = 0.0;
     const double step = 2.0 * M_PI * 440.0 / (double)SAMPLE_HZ;
-    for (int i = 0; i < frames; i++) {
-        for (size_t j = 0; j < FRAME_BYTES / 2; j++) {
-            pcm[j] = (int16_t)(sin(phase) * 8000.0);
-            phase += step;
-            if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+    int pushed = 0;
+    while (pushed < frames) {
+        for (int k = 0; k < speed && pushed < frames; k++, pushed++) {
+            for (size_t j = 0; j < FRAME_BYTES / 2; j++) {
+                pcm[j] = (int16_t)(sin(phase) * 8000.0);
+                phase += step;
+                if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
+            }
+            terminal_playback_push(SELFTEST_TURN, pcm, FRAME_BYTES);
         }
-        terminal_playback_push(SELFTEST_TURN, pcm, FRAME_BYTES);
-        vTaskDelay(pdMS_TO_TICKS(20));  // 服务端节奏：不突发灌满环
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
     terminal_playback_mark_end(SELFTEST_TURN);
     vTaskDelete(NULL);
 }
 
-esp_err_t terminal_playback_selftest(int ms) {
+esp_err_t terminal_playback_selftest(int ms, int speed) {
     if (ms <= 0 || ms > 5000) return ESP_ERR_INVALID_ARG;
+    if (speed < 1 || speed > 8) return ESP_ERR_INVALID_ARG;
     const esp_err_t err = terminal_playback_start(SELFTEST_TURN);
     if (err != ESP_OK) return err;
-    if (xTaskCreate(selftest_push_task, "pb_test", 3072, (void *)(intptr_t)(ms / 20), 4, NULL) !=
-        pdPASS) {
+    const int frames = ms / 20;
+    if (xTaskCreate(selftest_push_task, "pb_test", 3072,
+                    (void *)(intptr_t)((frames & 0xffff) | (speed << 16)), 4, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

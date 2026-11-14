@@ -56,6 +56,12 @@ void terminal_pav1_start(const char *host, int port);
 void terminal_pav1_stop(void);
 bool terminal_pav1_ready(void);
 
+// 音频通道累计收发计数（get_audio 排障用）：
+// rx = 从服务端收到的 PCM 帧数（不含 END），tx = 已发出的 PCM 帧数。
+uint32_t terminal_pav1_rx_frames(void);
+uint32_t terminal_pav1_rx_end(void);
+uint32_t terminal_pav1_tx_frames(void);
+
 // 正在建立/重建音频通道（连接中，尚不可送帧）。
 // 与 ready 区分开：服务端据此知道"等一会儿再试"而不是"设备不支持"。
 bool terminal_pav1_starting(void);

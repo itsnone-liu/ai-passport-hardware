@@ -19,3 +19,7 @@ bool terminal_audio_busy(void);
 // 纯音：只走 代码->I2S->codec DAC->扬声器，不经过麦克风。
 // 回环自测听不见时分不清是喇叭坏了还是麦克风没采到，这条能一刀切开。
 esp_err_t terminal_audio_tone_start(int ms, int hz);
+
+// 写入节流测试：连写 frames 帧静音，回报总耗时/首帧耗时。
+// 用来判定 bsp_audio_write 是否按 I2S 时钟阻塞（播放侧能否依赖它当节拍）。
+esp_err_t terminal_audio_pace_test(int frames);

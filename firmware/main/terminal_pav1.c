@@ -542,6 +542,10 @@ void terminal_pav1_stop(void) {
 
 bool terminal_pav1_ready(void) { return s_ready; }
 
+uint32_t terminal_pav1_rx_frames(void) { return s_rx_frames; }
+uint32_t terminal_pav1_rx_end(void) { return s_rx_end; }
+uint32_t terminal_pav1_tx_frames(void) { return s_tx_frames; }
+
 bool terminal_pav1_starting(void) { return s_should_run && !s_ready; }
 
 int terminal_pav1_send_pcm(uint32_t turn_id, const void *pcm, size_t n) {
