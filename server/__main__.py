@@ -41,6 +41,12 @@ def build_backends(cfg: Config):
             raise SystemExit("brain=dsh requires dsh_url; see server/dsh/README.md")
         from server.dsh.http import DshHTTPBrain
         brain = DshHTTPBrain(cfg.dsh_url, cfg.dsh_token)
+    elif cfg.brain == "dsh-cli":
+        # Measured 5.1 s per turn on this host (node boot ~2.5 s + model round
+        # trip). Fine for notifications, slow for conversation -- see
+        # server/dsh/README.md before making it the default.
+        from server.dsh.cli import DshCLIBrain
+        brain = DshCLIBrain(profile=cfg.dsh_profile, binary=cfg.dsh_binary)
     else:
         brain = MockBrain()
     return asr, tts, brain
@@ -75,7 +81,7 @@ def main(argv=None) -> int:
     ap.add_argument("--audio-port", type=int, default=None)
     ap.add_argument("--asr", choices=["mock", "bailian"], default=None)
     ap.add_argument("--tts", choices=["mock", "bailian"], default=None)
-    ap.add_argument("--brain", choices=["mock", "dsh"], default=None)
+    ap.add_argument("--brain", choices=["mock", "dsh", "dsh-cli"], default=None)
     ap.add_argument("--device", action="append", default=[],
                     metavar="ID=SECRET", help="devices that may connect (repeatable)")
     ap.add_argument("--log-level", default="INFO")

@@ -15,7 +15,8 @@ Passport 拨过来的两条通道（控制 JSONL + 音频 PAV1）的正式服务
 | `asr/bailian.py` | ✅ `qwen-audio-3.0-realtime-plus`（OpenAI-Realtime 兼容 WS 流式） |
 | `tts/bailian.py` | ✅ `qwen-audio-3.0-tts-plus`（SSE 流式，直接出 16k mono PCM） |
 | `dsh/mock.py` | ✅ 确定性回复 |
-| `dsh/http.py` | ⚠️ 未对真实 dsh 验证，见 `dsh/README.md` |
+| `dsh/cli.py` | ✅ 已对真实 dsh 验证（`--profile headless`，**4.8 s/轮**，见 `dsh/README.md`） |
+| `dsh/http.py` | ⚠️ 未对真实 dsh 验证 |
 | `__main__.py` | ✅ CLI 入口，mock 与真实后端可切换 |
 
 ## 跑起来
@@ -38,7 +39,9 @@ python3 -m server --config server/config/local.json
 ## 跑测试
 
 ```bash
-python3 -m unittest discover -s server/tests -t . -v    # 30 个用例，全 mock，约 3 s
+python3 -m unittest discover -s server/tests -t . -v    # 31 个用例，全 mock，约 3 s
+TOKENPLAN_API_KEY=... python3 -m unittest server.tests.test_bailian_smoke -v   # 真实 TTS→ASR
+PASSPORT_DSH_SMOKE=1 DEEPSEEK_API_KEY=... python3 -m unittest server.tests.test_dsh_cli -v
 TOKENPLAN_API_KEY=... python3 -m unittest server.tests.test_bailian_smoke -v
 python3 protocol/v1/make_vectors.py --check              # 合同没被手改
 ```

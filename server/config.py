@@ -39,6 +39,9 @@ class Config:
     dsh_url: str = ""
     dsh_token: str = ""
     dsh_session: str = "passport"
+    # One-shot CLI brain (documented entry point, but a process per turn).
+    dsh_binary: str = "dsh"
+    dsh_profile: str = "headless"
 
     # Protocol timers, from docs/voice-protocol-v1.md §8.
     hello_timeout: float = 5.0
