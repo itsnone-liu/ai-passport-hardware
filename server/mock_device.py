@@ -65,6 +65,7 @@ class MockPassport:
         self._seq = 0
         self.received_end = False
         self.server_audio_nonce = ""
+        self.audio_device_nonce = ""
         self.audio_authed = False
 
     # -- connection --------------------------------------------------------
@@ -103,9 +104,15 @@ class MockPassport:
             asyncio.open_connection(self.host, self.audio_port), timeout=timeout)
         self._audio_framer = pav1.Framer()
         self._audio_task = asyncio.create_task(self._audio_loop())
+        # A real device sends a fresh nonce on the audio channel. Reusing the
+        # control nonce here made the two possible mac inputs coincide, which is
+        # exactly how a wrong implemented reading passed this suite once.
+        import hashlib as _hashlib
+        self.audio_device_nonce = _hashlib.sha256(
+            f"{self.device_id}-{self.name}-audio-{time.time_ns()}".encode()).hexdigest()[:32]
         hello = json.dumps({"device_id": self.device_id, "proto": "v1",
                             "session_id": self.session_id,
-                            "nonce": self.device_nonce}).encode()
+                            "nonce": self.audio_device_nonce}).encode()
         self.audio_writer.write(pav1.encode_frame(pav1.KIND_HELLO, 0, hello))
         await self.audio_writer.drain()
         # server replies HELLO with its nonce, then we AUTH
@@ -114,8 +121,8 @@ class MockPassport:
             if time.monotonic() > deadline:
                 raise TimeoutError("no audio hello ack")
             await asyncio.sleep(0.01)
-        mac = pav1.auth_mac(self.secret, "audio", self.device_id, self.device_nonce,
-                            self.server_audio_nonce)
+        mac = pav1.auth_mac(self.secret, "audio", self.device_id,
+                            self.audio_device_nonce, self.server_audio_nonce)
         self.audio_writer.write(pav1.encode_frame(
             pav1.KIND_AUTH, 0, json.dumps({"mac": mac}).encode()))
         await self.audio_writer.drain()

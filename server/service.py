@@ -247,7 +247,8 @@ class Session:
         self.session_id = session_id
         self.control: Optional[ControlLink] = None
         self.audio: Optional[AudioLink] = None
-        self.device_nonce = ""
+        self.device_nonce = ""            # control-channel HELLO
+        self.device_nonce_audio = ""      # audio-channel HELLO -- a different value
         self.server_nonce_control = ""
         self.server_nonce_audio = ""
         self.authed = False
@@ -265,6 +266,10 @@ class Session:
         self._played_end = asyncio.Event()
         self._capture_ended = asyncio.Event()
         self._last_capture_reason = ""
+        self.probe_frames = 0
+        self.probe_bytes = 0
+        self.probe_last_turn = 0
+        self._probe_log_at = 0.0
         self._last_end_reason = ""
         self._current_prefix = b""
 
@@ -276,10 +281,16 @@ class Session:
         reusing the control nonce would make an audio handshake replayable into
         a control handshake, which is the one thing nonces are here to prevent.
         """
-        server_nonce = (self.server_nonce_audio if side == "audio"
-                        else self.server_nonce_control)
+        if side == "audio":
+            # The audio channel authenticates with the pair *it* exchanged in its
+            # own HELLO. Mixing one side from control and one from audio also
+            # produces a valid-looking digest, which is why this was ambiguous
+            # for a whole round: see protocol §3.3.
+            device_nonce, server_nonce = self.device_nonce_audio, self.server_nonce_audio
+        else:
+            device_nonce, server_nonce = self.device_nonce, self.server_nonce_control
         return pav1.auth_mac(self.service.cfg.devices[self.device_id], side,
-                             self.device_id, self.device_nonce, server_nonce)
+                             self.device_id, device_nonce, server_nonce)
 
     # -- ids ---------------------------------------------------------------
     def next_server_id(self) -> int:
@@ -411,7 +422,12 @@ class Session:
             await link.close()
             return
         self.audio = link
-        self.service.note_audio_nonce(self.session_id, obj.get("nonce", ""))
+        self.device_nonce_audio = str(obj.get("nonce", ""))
+        if not self.device_nonce_audio:
+            await link.send_json(pav1.KIND_HELLO, {"ok": False, "err": "bad_frame"})
+            await link.close()
+            return
+        self.service.note_audio_nonce(self.session_id, self.device_nonce_audio)
         self.server_nonce_audio = self.service.new_nonce()
         await link.send_json(pav1.KIND_HELLO, {"ok": True,
                                                "server_nonce": self.server_nonce_audio})
@@ -427,6 +443,18 @@ class Session:
 
     def on_uplink_pcm(self, turn_id: int, payload: bytes) -> None:
         if self.active_turn != turn_id or self.state != STATE_LISTENING:
+            if self.cfg.dev_audio_probe:
+                # W2-3 hands us frames before capture.start exists. Count them so
+                # framing can be verified now; never play them, never ASR them.
+                self.probe_frames += 1
+                self.probe_bytes += len(payload)
+                self.probe_last_turn = turn_id
+                now = time.monotonic()
+                if now - self._probe_log_at >= 1.0:
+                    self._probe_log_at = now
+                    log.info("%s uplink probe: %d frames / %d bytes (turn %d, %.2f s)",
+                             self.device_id, self.probe_frames, self.probe_bytes,
+                             turn_id, self.probe_bytes / 32000)
             return
         if len(self._capture_buf) + len(payload) > self.cfg.max_capture_bytes:
             overflow = len(self._capture_buf) + len(payload) - self.cfg.max_capture_bytes
@@ -793,6 +821,16 @@ class Service:
                     "looks_like_undecoded_hex": (len(key) == 64 and all(
                         c in b"0123456789abcdefABCDEF" for c in key)),
                 } for dev, key in self.cfg.devices.items()]}
+            if op == "audio":
+                session = self.sessions[str(req.get("device", ""))]
+                return {"ok": True, "device_id": session.device_id,
+                        "state": session.state, "turn_id": session.active_turn,
+                        "audio_link": bool(session.audio and session.audio.authed),
+                        "rx_frames": session.probe_frames,
+                        "rx_bytes": session.probe_bytes,
+                        "rx_seconds": round(session.probe_bytes / 32000, 2),
+                        "last_turn_seen": session.probe_last_turn,
+                        "turns_done": len(session.metrics)}
             if op == "show":
                 session = self.sessions[str(req.get("device", ""))]
                 return {"ok": True, "reply": await session.show_text(str(req.get("text", "")))}

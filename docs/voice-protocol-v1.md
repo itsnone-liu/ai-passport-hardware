@@ -121,6 +121,18 @@ audio_mac = HMAC-SHA256(secret, "PAV1AUTH|audio|<device_id>|<device_nonce>|<serv
 载荷 `{"mac":"<hex>"}`；服务端回 `HELLO {"ok":true}`（同帧类型，`type` 字段区分）。
 认证通过前到达的 `PCM` 帧必须丢弃并报 `NOT_AUTHED`。
 
+> **`audio_mac` 用的是哪一对 nonce（2026-11-14 真机踩坑，必读）**
+>
+> 现场同时存在两对 nonce：控制通道 HELLO 换来的那一对，和音频通道 HELLO 自己换来的那一对。
+> 上式的 `<device_nonce>`/`<server_nonce>` **指的是音频通道 HELLO 里那一对**，
+> 与控制通道的 nonce 无关。设备每条通道各自产生 device nonce，服务端为每条通道各自发放
+> server nonce。
+>
+> 为什么必须写死：四种组合都能算出**合法**摘要（音频+音频、控制+控制、音频dev+控制srv、
+> 控制dev+音频srv），没有任何一侧会报"算错"，症状只有 `auth_failed`。真机实测中服务端
+> 曾用"控制 dev + 音频 srv"，设备用"音频 dev + 音频 srv"，各自都正确、结果不同。
+> 单测见 `server/tests/test_pav1.py::TestAudioMacAmbiguity`（四种读法的期望值都钉住）。
+
 **音频通道的打开时机（签认时补定）**：`auth` 成功后**立即**拨号并保持长连接，不在按键时
 再连——省掉一次 TCP+TLS 都不需要但确实存在的三向握手，也让 `capture.start` 一到就能立刻推流。
 掉线后按需重开（重连即重走 §3.3 握手），不做"常开且无限重试"的守护循环：连续失败就退回

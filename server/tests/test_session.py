@@ -491,3 +491,36 @@ class TestHelloFallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("server_nonce", reply)
         writer.close()
         await svc.stop()
+
+
+class TestDevAudioProbe(unittest.IsolatedAsyncioTestCase):
+    """Frames before capture.start exist must be observable, not silently dropped."""
+
+    async def test_probe_counts_untracked_frames(self):
+        svc = await make_service()
+        svc.cfg.dev_audio_probe = True
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        session = svc.session_of(DEVICE)
+        # pretend the firmware is pushing vendor.uplink_test frames with turn 7
+        payload = b"\x00" * 640
+        for _ in range(5):
+            session.on_uplink_pcm(7, payload)
+        self.assertEqual(5, session.probe_frames)
+        self.assertEqual(3200, session.probe_bytes)
+        self.assertEqual(7, session.probe_last_turn)
+        # and the pipeline must not have started anything
+        self.assertIsNone(session.active_turn)
+        self.assertEqual(STATE_IDLE, session.state)
+        await dev.close()
+        await svc.stop()
+
+    async def test_probe_is_off_by_default(self):
+        svc = await make_service()
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        session = svc.session_of(DEVICE)
+        session.on_uplink_pcm(7, b"\x00" * 640)
+        self.assertEqual(0, session.probe_frames)
+        await dev.close()
+        await svc.stop()

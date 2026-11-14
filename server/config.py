@@ -76,6 +76,11 @@ class Config:
     # sessions get no audio and are logged loudly. Never enable on a public host.
     allow_anonymous: bool = False
 
+    # Dev-only: count PAV1 PCM frames that do not belong to a turn, so firmware
+    # can prove frame boundaries end to end (vendor.uplink_test) before
+    # capture.start exists. Counted, never played, never fed to ASR.
+    dev_audio_probe: bool = False
+
     # Protocol timers, from docs/voice-protocol-v1.md §8.
     hello_timeout: float = 5.0
     request_timeout: float = 5.0

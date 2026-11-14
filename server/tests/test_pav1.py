@@ -199,3 +199,37 @@ class TestCapacityMath(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestAudioMacAmbiguity(unittest.TestCase):
+    """The audio mac has four plausible inputs; only one is the contract.
+
+    Real incident (2026-11-14): the service mixed the control device nonce with
+    the audio server nonce, the device used the audio pair, and both produced
+    valid-looking digests. This test pins the choice so it cannot drift again.
+    """
+
+    SECRET = bytes.fromhex("32f9c62ccb67b64f349d8b184f03acf9a308b4db7682a5cd1afdda682374ee44")
+    DEV = "psp-f53038"
+    C_DEV = "46e4a6fc52123ae857368eb8d0602627"
+    C_SRV = "a028516128087f1ef66b0f27139b3bd3"
+    A_DEV = "6dae2458213f06cfa3515642dcf399c0"
+    A_SRV = "1740ba37fb649a55ec8999169e66c46b"
+
+    def mac(self, dev_nonce, server_nonce, role="audio"):
+        return pav1.auth_mac(self.SECRET, role, self.DEV, dev_nonce, server_nonce)
+
+    def test_the_audio_pair_is_the_answer(self):
+        self.assertEqual("9c8ce9b8c29aa4f6b02abca399b0bbf51934c32cdc20e8218ba4163428b2acbf",
+                         self.mac(self.A_DEV, self.A_SRV))
+
+    def test_the_other_three_readings_are_different_digests(self):
+        """If any of these ever collide, someone changed the canonical string."""
+        expected = {
+            (self.C_DEV, self.C_SRV): "3a396e80b0438baf8be5989a06855c9b8f4c4b984d88b35948d0871bb789fa12",
+            (self.A_DEV, self.C_SRV): "fb59133ea1b3fa808d4c7619e5e4e0f70e9d2905f2f2ca49de974d4e7163872f",
+            (self.C_DEV, self.A_SRV): "b06f70d2a8a52542147193ad35ebfd3188596470deafaa7340b527a838bf8147",
+        }
+        for (dn, sn), digest in expected.items():
+            self.assertEqual(digest, self.mac(dn, sn))
+        self.assertEqual(4, len({self.mac(self.A_DEV, self.A_SRV),
+                                 *[self.mac(d, s) for d, s in expected]}))
