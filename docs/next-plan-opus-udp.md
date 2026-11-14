@@ -59,7 +59,8 @@ PCM 扛住最坏抖动需 42 KB —— 永远不可能；Opus 需 4 KB —— �
 **改动**
 1. 待发环从"丢最新"改为**丢最旧**（与上游一致：送出的永远是最近的声音）；
 2. 环深按**时间**定义而不是帧数（建议 6 帧 = 120 ms，仍为静态 BSS 3.9 KB）；
-3. `get_audio` 暴露**最老帧年龄**（ms），联调时一眼看出延迟堆积。
+3. `get_audio` 暴露**最老帧年龄**（ms），联调时一眼看出延迟堆积；
+4. **修 state 不复位的缺陷**（见 §6）：正常收轮后 `state` 永远停在 `processing`。
 
 **判据**：PCM 路径在 RTT 平稳时仍 `dropped=0`；人为制造 300 ms 停顿后，
 `最老帧年龄` 不超过环容量、恢复后不出现"越积越旧"。
@@ -157,4 +158,33 @@ PCM 扛住最坏抖动需 42 KB —— 永远不可能；Opus 需 4 KB —— �
 - 恢复：`esptool write_flash 0x0 D:\dsh-work\flash\full-backup.bin`
 - 固件源码：`D:\esp\ai-passport`（本地）↔ `itsnone-liu/ai-passport-hardware` 分支
   `feat/passport-voice-windows`（远端，REST API 推送，tree SHA 校验）
-- 不要提交：`server/config/devices/<id>.secret`、任何 `sk-` / `ghp_` 凭据
+- 不要提交：`server/config/devices/<id>.secret`、任何 `sk-` / `ghp-` 凭据
+
+---
+
+## 6. 顺手修的小缺陷（2026-11-14 夜发现）
+
+**现象**：收轮之后 `get_status` 的 `state` 永远显示 `processing`，不再回到 `idle`。
+
+**证据**（`main/terminal_capture.c`）：
+- `finish_turn()` 在结尾 `set_state("processing")`（第 230 行）；
+- 全文件只有两处 `set_state("idle")`：按键超时分支（355）与"空轮取消"分支（408）；
+- **正常收轮路径（`released` / `uplink_stall` / `heap_guard` / `max_duration` / `error`）
+  之后没有任何复位**，于是状态永久停在 `processing`。
+
+**影响**：不影响功能——`terminal_capture_start()` 的守卫看的是 `s_active || s_req_start`，
+不是 `s_state`，所以下一轮仍能正常起采。但**遥测失真**：外部（含联调时的我）
+会把 `processing` 误读成"仍在处理上一轮"，从而怀疑设备卡住。
+
+**修法**：在任务进入"无事可做"的等待分支前复位：
+
+```c
+if (!s_armed && !s_active && !s_req_start) {
+    set_state("idle");
+    xTaskNotifyWait(0, 0xffffffff, NULL, portMAX_DELAY);
+    continue;
+}
+```
+
+**教训（写给自己）**：状态字符串是给外部看的接口，不是内部变量。
+凡是"设了不复位"的状态机字段，第一次联调就会变成误判源。
