@@ -17,8 +17,11 @@
 服务端不需要任何入站端口配置，设备也不需要知道自己公网地址。
 """
 
+import logging
 import struct
 from typing import Dict, List, Tuple
+
+log = logging.getLogger(__name__)
 
 HDR = struct.Struct("<4sBBHII")
 HDR_LEN = HDR.size
@@ -116,7 +119,14 @@ class DatagramProtocol:
         self.service = service
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: ANN001
-        self.service.on_udp_datagram(data, addr, self.transport)
+        # 回调里任何异常都会被 asyncio 吞成一行栈：服务照跑、包照到、日志照静。
+        # 实测这样让整条 UDP 音频通道看起来"根本没收到包"。兜底 + 计数。
+        try:
+            self.service.on_udp_datagram(data, addr, self.transport)
+        except Exception:  # noqa: BLE001 - 单包出错不能拖垮整条通道
+            self.service.udp_errors += 1
+            if self.service.udp_errors <= 3:
+                log.exception("%s udp datagram handler failed", self.service)
 
     def error_received(self, exc) -> None:  # noqa: ANN001
         self.service.udp_errors += 1
