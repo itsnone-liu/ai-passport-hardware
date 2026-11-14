@@ -13,6 +13,30 @@ from dataclasses import dataclass, field
 from typing import Dict
 
 
+def decode_secret(raw: bytes) -> bytes:
+    """Interpret a secret exactly the way the device's `provision` does.
+
+    Rule (agreed with the firmware, documented in the protocol §3.1):
+    even length, all hex, at least 32 characters -> hex-decode to bytes;
+    anything else -> use the raw bytes as they are.
+
+    This existed as an implicit assumption on both sides, which is the worst
+    kind: the service read the 64-character hex *text* as the key while the
+    device decoded it to 32 bytes, and the only visible symptom was
+    `auth_failed` with no hint as to which half was wrong.
+    """
+    text = raw.strip()
+    as_text = text.decode("ascii", "replace")
+    looks_hex = (len(text) >= 32 and len(text) % 2 == 0
+                 and all(c in "0123456789abcdefABCDEF" for c in as_text))
+    if looks_hex:
+        try:
+            return bytes.fromhex(as_text)
+        except ValueError:
+            return text
+    return text
+
+
 @dataclass
 class Config:
     host: str = "0.0.0.0"
@@ -75,9 +99,9 @@ class Config:
                 secret = entry.get("secret", "")
                 if secret.startswith("file:"):
                     with open(secret[5:], "rb") as sf:
-                        secrets[device_id] = sf.read().strip()
+                        secrets[device_id] = decode_secret(sf.read())
                 else:
-                    secrets[device_id] = secret.encode()
+                    secrets[device_id] = decode_secret(secret.encode())
             raw.pop("devices", None)
             for key, value in raw.items():
                 if hasattr(cfg, key):

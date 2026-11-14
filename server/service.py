@@ -362,6 +362,7 @@ class Session:
             return
         self.authed = True
         link.authed = True
+        log.info("auth ok for %s session=%s", self.device_id, self.session_id[:8])
         await link.send({"id": rid, "ok": True, "cmd": "auth",
                          "server_mac": self.mac_for("server")})
 
@@ -779,6 +780,19 @@ class Service:
                 reply = await self.send_raw(str(req.get("device", "")), payload,
                                             timeout=float(req.get("timeout", 20)))
                 return {"ok": True, "reply": reply}
+            if op == "devices":
+                # Ops view: which devices are known and how the secret was read.
+                # "64 chars, still text" was a real bug that only auth_failed
+                # reported; this turns it into one admin call.
+                return {"ok": True, "devices": [{
+                    "device_id": dev,
+                    "key_bytes": len(key),
+                    # A 64-byte all-hex key is the signature of "we read the hex
+                    # text instead of decoding it" -- the bug that cost this
+                    # project an auth round trip.
+                    "looks_like_undecoded_hex": (len(key) == 64 and all(
+                        c in b"0123456789abcdefABCDEF" for c in key)),
+                } for dev, key in self.cfg.devices.items()]}
             if op == "show":
                 session = self.sessions[str(req.get("device", ""))]
                 return {"ok": True, "reply": await session.show_text(str(req.get("text", "")))}
@@ -854,9 +868,25 @@ class Service:
             self.sessions[device_id] = session
             self.by_session_id[session.session_id] = session
             server_nonce = self.new_nonce()
-            self.note_control_nonce(device_id, str(msg.get("nonce", "")), server_nonce)
+            try:
+                self.note_control_nonce(device_id, str(msg.get("nonce", "")), server_nonce)
+            except PermissionError:
+                # A replayed nonce is an auth problem, not a crash: answer in a
+                # way the peer can act on instead of dropping the socket silently.
+                log.warning("hello from %s rejected: nonce %s… already used "
+                            "(a device that generates one nonce per boot will loop "
+                            "here; it must be fresh per connection)",
+                            device_id, str(msg.get("nonce", ""))[:8])
+                writer.write((json.dumps({"id": rid, "ok": False, "cmd": "hello",
+                                          "err": "replay"}) + "\n").encode())
+                await writer.drain()
+                writer.close()
+                return
             session.device_nonce = str(msg.get("nonce", ""))
             session.server_nonce_control = server_nonce
+            log.info("hello %s auth=%s nonce=%s… session=%s", device_id,
+                     "hmac" if provisioned else "none", str(msg.get("nonce", ""))[:8],
+                     session.session_id[:8])
             await link.send({"id": rid, "ok": True, "cmd": "hello",
                              "proto": "v1", "server_nonce": server_nonce,
                              "session_id": session.session_id,
