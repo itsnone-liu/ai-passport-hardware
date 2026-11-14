@@ -1,21 +1,25 @@
-# 固件镜像 / 编译产物（版权内容 + 体积大，不入库）
+# firmware images and build artefacts (large, and partly vendor-licensed)
 *.bin
 *.elf
 *.map
 flash/
 build/
 managed_components/
+sdkconfig
+sdkconfig.old
 
-# 本地工具与虚拟环境
+# local tooling / virtualenvs
 tools/
 venv/
 __pycache__/
 *.pyc
 
-# 抓包与日志
+# captures and logs
 *.pcap
 *.btsnoop
+hw-*.txt
+boot-*.txt
 
-# 系统杂项
+# OS noise
 .DS_Store
 Thumbs.db
