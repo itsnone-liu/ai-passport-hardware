@@ -92,6 +92,87 @@ static void send_hello(void) {
     if (w > 0) s_hello++;
 }
 
+// 下行重排窗：4 块 = 80 ms。上行实测 142 块里有 1 块乱序，按到达顺序播会把
+// 相邻两个 20 ms 块调个位置——不是静音也不是爆音，是音节内部错位，很难查。
+// 窗口小是有意的：等太久会吃掉播放环的余量，80 ms 足够盖住这条链路的抖动。
+#define DOWN_WIN 4
+static uint8_t s_win_blk[DOWN_WIN][ADPCM_BLOCK_BYTES];
+static uint32_t s_win_seq[DOWN_WIN];
+static uint32_t s_win_turn[DOWN_WIN];
+static bool s_win_used[DOWN_WIN];
+static bool s_down_started;
+static uint32_t s_down_expected;
+static uint32_t s_down_turn;
+static uint32_t s_late, s_reorder, s_gap;
+
+static void win_clear(void) {
+    for (int i = 0; i < DOWN_WIN; i++) s_win_used[i] = false;
+}
+
+// 按 seq 投递，遇洞先等；窗口被更靠前的块占满就认定洞里那块丢了，跳过去。
+static void deliver(uint32_t seq) {
+    const int slot = (int)(seq % DOWN_WIN);
+    int16_t pcm[ADPCM_SAMPLES];
+    adpcm_dec_block(s_win_blk[slot], pcm);
+    if (terminal_playback_push(s_win_turn[slot], pcm, sizeof pcm)) s_down++;
+    s_win_used[slot] = false;
+    s_down_expected = seq + 1;
+}
+
+static void drain_in_order(void) {
+    while (s_win_used[s_down_expected % DOWN_WIN] &&
+           s_win_seq[s_down_expected % DOWN_WIN] == s_down_expected) {
+        deliver(s_down_expected);
+    }
+}
+
+static void win_push(uint32_t turn, uint32_t seq, const uint8_t *blk) {
+    if (!s_down_started || turn != s_down_turn) {
+        // 换轮：上一轮压着的块一律作废，别把上一句话的尾巴接到这一句上。
+        s_down_started = true;
+        s_down_turn = turn;
+        s_down_expected = seq;
+        win_clear();
+    }
+    if ((int32_t)(seq - s_down_expected) < 0) {   // 迟到或重复：丢掉，不重复出声
+        s_late++;
+        return;
+    }
+    const int slot = (int)(seq % DOWN_WIN);
+    if (s_win_used[slot]) {
+        if (s_win_seq[slot] == seq) {      // 重复包
+            s_late++;
+            return;
+        }
+        s_reorder++;                       // 这一格被更靠前的块顶掉，等于丢了一块
+    } else if (seq != s_down_expected) {
+        s_reorder++;                       // 乱序到达：先存着
+    }
+    memcpy(s_win_blk[slot], blk, ADPCM_BLOCK_BYTES);
+    s_win_seq[slot] = seq;
+    s_win_turn[slot] = turn;
+    s_win_used[slot] = true;
+    drain_in_order();
+    // 洞口大过窗口：再等也等不回来，跳到窗口里最小的那块继续吐，
+    // 否则播放环会被这一个洞卡到饿死（那是几百毫秒的静音）。
+    if ((uint32_t)(seq - s_down_expected) >= DOWN_WIN) {
+        uint32_t best = 0;
+        bool any = false;
+        for (int i = 0; i < DOWN_WIN; i++) {
+            if (!s_win_used[i]) continue;
+            if (!any || (int32_t)(s_win_seq[i] - best) < 0) {
+                best = s_win_seq[i];
+                any = true;
+            }
+        }
+        if (any && (int32_t)(best - s_down_expected) > 0) {
+            s_gap++;
+            s_down_expected = best;
+            drain_in_order();
+        }
+    }
+}
+
 // 收数据报：kind=2 是打洞 ack，kind=5 是下行音频块（服务端→设备）。
 // 下行也走同一条洞，所以这里两头都要认：只认 ack 的话，打通了也照样没声音。
 static void poll_rx(void) {
@@ -121,9 +202,10 @@ static void poll_rx(void) {
         }
         const uint32_t turn = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) |
                               ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
-        int16_t pcm[ADPCM_SAMPLES];
-        adpcm_dec_block(buf + UDP_HDR_LEN + 4, pcm);
-        if (terminal_playback_push(turn, pcm, sizeof pcm)) s_down++;
+        const uint8_t *p = buf + UDP_HDR_LEN;
+        const uint32_t seq = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                             ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        win_push(turn, seq, p + 4);
     }
 }
 
@@ -175,6 +257,8 @@ bool terminal_udp_start(uint32_t peer_ip, uint16_t peer_port) {
         s_sock = fd;
     }
     s_should_run = true;
+    s_down_started = false;   // 新通道：下行窗口清空，从服务端下一个块重新对齐
+    win_clear();
     if (xTaskCreate(udp_task, "udp", 3072, NULL, 4, &s_task) != pdPASS) {
         close(s_sock);
         s_sock = -1;
@@ -220,8 +304,10 @@ bool terminal_udp_send_adpcm(uint32_t turn, uint32_t seq, const uint8_t *blk, si
 void terminal_udp_diag(char *buf, size_t n) {
     snprintf(buf, n,
              "\"udp_ready\":%s,\"udp_sent\":%u,\"udp_fail\":%u,\"udp_ack\":%u,"
-             "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
+             "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_late\":%u,"
+             "\"udp_reorder\":%u,\"udp_gap\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
              terminal_udp_ready() ? "true" : "false", (unsigned)s_sent, (unsigned)s_fail,
-             (unsigned)s_acks, (unsigned)s_hello, (unsigned)s_down, (unsigned)s_bad, s_slow ? "true" : "false",
+             (unsigned)s_acks, (unsigned)s_hello, (unsigned)s_down, (unsigned)s_bad,
+             (unsigned)s_late, (unsigned)s_reorder, (unsigned)s_gap, s_slow ? "true" : "false",
              s_last_errno, (long long)s_ack_ms);
 }

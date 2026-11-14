@@ -224,6 +224,8 @@ static void emit_error(const char *code, uint32_t turn_id) {
     terminal_link_send_src(LINK_SRC_TCP, ev);
 }
 
+static int drain_pending(void);   // 定义在下面；flush_preroll 要边走边发
+
 // pre-roll 里最旧的先发：按 head 反推起点，顺序不发反（发反了 ASR 听到的是倒放）。
 // 用非阻塞写 + 待发环：起轮瞬间对端 ACK 还没回来，写不进去是正常的，
 // 帧留在环里，下一拍继续，不该因此把整个 pre-roll 丢掉。
@@ -233,6 +235,10 @@ static void flush_preroll(void) {
     for (int i = 0; i < n; i++) {
         const int idx = (first + i) % PREROLL_FRAMES;
         if (!pend_push_pcm(s_pre[idx])) s_dropped++;
+        // 边走边发。pre-roll 是 15 帧（300 ms），待发环只有 10 帧（200 ms），
+        // 整段塞完再发必然把最旧的 5 帧挤掉——那正是用户开口前的那句话头。
+        // 实测每轮固定 dropped=6，就是这里丢的。
+        drain_pending();
     }
     s_pre_count = 0;
     s_pre_head = 0;
