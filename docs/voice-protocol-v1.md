@@ -2,9 +2,10 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | **DRAFT 1（Ubuntu 侧初稿，待 Windows Agent 书面签认后冻结为 v1）** |
+| 状态 | **FROZEN v1.0（2026-11-14）** — 双方签认，wire format 冻结 |
 | 作者 | Ubuntu Agent（语音服务 / dsh 集成） |
-| 基线 | `ai-passport-hardware` `main @ 913f3ab`（2026-11-14）；已参考 `feat/passport-voice-windows @ c36903f` 的 W0 修复 |
+| 签认 | Windows Agent：[`docs/voice-protocol-v1-windows-signoff.md`](voice-protocol-v1-windows-signoff.md) @ `27c133f`（D1–D8 全部同意，D6 由实测结案） |
+| 基线 | `ai-passport-hardware` `main @ 913f3ab`；已吸收 `feat/passport-voice-windows @ 27c133f` 的 W0 修复与真机实测 |
 | 测试向量 | [`protocol/v1/vectors.json`](../protocol/v1/vectors.json) + 生成器 [`make_vectors.py`](../protocol/v1/make_vectors.py) |
 | 依据 | 双 Agent 任务书 §1（P0）、§1.6（测试向量）、§4（版本纪律） |
 
@@ -111,6 +112,11 @@ audio_mac = HMAC-SHA256(secret, "PAV1AUTH|audio|<device_id>|<device_nonce>|<serv
 载荷 `{"mac":"<hex>"}`；服务端回 `HELLO {"ok":true}`（同帧类型，`type` 字段区分）。
 认证通过前到达的 `PCM` 帧必须丢弃并报 `NOT_AUTHED`。
 
+**音频通道的打开时机（签认时补定）**：`auth` 成功后**立即**拨号并保持长连接，不在按键时
+再连——省掉一次 TCP+TLS 都不需要但确实存在的三向握手，也让 `capture.start` 一到就能立刻推流。
+掉线后按需重开（重连即重走 §3.3 握手），不做"常开且无限重试"的守护循环：连续失败就退回
+「无音频」状态并在 `get_status` 里如实反映（`audio_ready:false`），控制通道继续可用。
+
 ---
 
 ## 4. 音频格式
@@ -121,7 +127,7 @@ audio_mac = HMAC-SHA256(secret, "PAV1AUTH|audio|<device_id>|<device_nonce>|<serv
 | 采样率 | **16000 Hz** | 单一值；百炼 realtime ASR 与 TTS 都直接输出这个格式 |
 | 声道 | **1（mono）** | |
 | 首选帧长 | 20 ms = **640 B** | 与 I2S DMA 块和 20 ms 网络节拍对齐 |
-| 允许帧长 | 40 ms = 1280 B | 若实测 DMA 更省事可用，但**整条连接内必须一致**，并写进 `hello` |
+| 允许帧长 | 40 ms = 1280 B | **仅为将来兼容保留，v1 设备不使用**；两端一律按 640 B 实现，`hello` 里不协商帧长 |
 | 码率 | 32 KB/s（256 kbit/s）单向 | 双向同时最多 64 KB/s，4 Mbps 链路毫无压力 |
 
 - **设备是上行时钟源**：采集按 I2S 真实时钟分帧，帧间隔的等效采样数必须是 320 的整数倍；
@@ -130,6 +136,13 @@ audio_mac = HMAC-SHA256(secret, "PAV1AUTH|audio|<device_id>|<device_nonce>|<serv
   服务端不得突发灌入整段（会打爆设备内存）。
 - 两方向不做重采样协商：**服务端负责把任意 TTS 输出转成 16 kHz mono s16**，设备不接触
   任何第三方采样率。
+
+> **D6 结案（真机实测，2026-11-14）**：同一构建、同一设备，只改帧长——
+> 20 ms/640 B（100 帧）与 40 ms/1280 B（50 帧）**读失败 0、写失败 0、2000 ms 名义耗时同为
+> 1992 ms、rate_ratio 同为 99**。总字节相同、耗时相同 ⇒ 节拍由 codec 时钟决定，与帧长无关。
+> 所以"ES8311 DMA 只能 40 ms"的退路不存在，v1 定为 640 B，且**不在 `hello` 里协商帧长**——
+> 少一个可协商项就少一个分叉点。非法帧长（如 25 ms）设备侧返回 `ESP_ERR_INVALID_ARG`，
+> 不静默降级。
 
 ---
 
@@ -216,13 +229,18 @@ while (len >= 16) {
 
 | 事件 | 说明 |
 |---|---|
-| `ready` `{link:"usb"\|"net"}` | 每条载体各自一次 |
+| `ready` `{link:"usb"\|"net"}` | 每条载体各自一次，**必须在 `auth` 成功之后才发** |
 | `key` `{btn,ev}` | 原样保留；`ev` ∈ press/click/double/long/release |
 | `capture.started` `{turn_id}` | pre-roll 已补发，开始送实时帧 |
 | `capture.ended` `{turn_id,reason}` | `released`/`cancelled`/`max_duration`/`error` |
 | `playback.started` `{turn_id}` | I2S 已出第一块声音 |
 | `playback.ended` `{turn_id,reason}` | `completed`/`cancelled`/`underrun`/`error` |
 | `error` `{turn_id?,code,detail?}` | 结构化，见 §6.5 |
+
+`ready` 的时机是签认时补定的：早期固件连上就发 `ready`，而 §3.2 规定 auth 之前除 `hello`/`auth`
+外一律 `unauthorized`——两者直接冲突，且三次就会关连接。**定案：`ready` 在 `auth` 成功后发**，
+其 `link` 字段只用于 UI 提示，不承载会话语义；服务端在认证前收到任何事件都只记录并忽略，
+不计数、不触发轮次。
 
 ### 6.5 错误码（稳定，不得改写语义）
 
@@ -282,6 +300,19 @@ while (len >= 16) {
 - 状态只由服务端 `state.set` + 设备本地事件共同驱动；设备不得自行发明状态（避免 UI 与服务端认知分叉）。
 - `scan` / `set_net` 执行期间禁止开新语音轮（`busy`），避免断 Wi-Fi 打断会话。
 
+### 7.3 `scan` / `set_net` 会终止整个会话（不是「暂停」）
+
+扫描必须让 WiFi 驱动主动 disconnect（否则 `esp_wifi_scan_start` 直接返回
+`ESP_ERR_WIFI_STATE`），`set_net` 要重建 STA。后果是**两条 TCP 通道同时断、
+当前 `session_id` 作废**：
+
+- 设备侧：正在播放的音频立即停止，上报（若还能上报）`playback.ended{reason:"cancelled"}`；
+  若来不及，对端消失本身即为终止信号。
+- 服务端侧：必须把「对端消失」当作正常收尾路径——结束当前轮、丢弃该 session 的发送队列、
+  不重放旧音频；收到设备重连后的新 `hello` 视为**新会话**。
+- 上层调用：`scan`/`set_net` 只允许在 `idle` 发起；服务端在发起前必须确认无活动轮次，
+  否则先 `playback.stop` 再下发。
+
 ### 7.3 打断
 
 - 播放中按键 → 设备立即静音并清空环形缓冲（不再播任何排队帧），上报 `key` 事件。
@@ -320,14 +351,17 @@ while (len >= 16) {
 | 帧上限 | 4096 B | 单帧最多 128 ms 音频 |
 | 控制行上限 | 入 512 B / 出 2048 B | 固件实际值（`LINE_MAX`/`TX_MAX`） |
 
-设备侧内存账（供 Windows 侧核对，非约束）：
+设备侧内存账（供 Windows 侧核对，非约束）。**注**：早期稿写的"可用堆 ~170 KB"是估算，真机
+（Wi-Fi + LVGL + UI 全起、运行 21 s）实测为 `heap=118624 / heap_min=113236 / heap_block=106496`。
+55 KB 预算仍成立（最大单块 38,400 B ≪ 106,496 B），但余量是 ~63 KB 而不是 ~115 KB。
+这三个数已做进固件 `get_status`，联调时服务端**直接读**，不要估算：
 
 ```
 pre-roll 环   9,600 B
 播放环       38,400 B
 解析/发送缓冲 ~4 KB
 I2S DMA      4 × 640 B ≈ 2.6 KB
-合计         ≈ 55 KB   （启动后可用堆 ~170 KB 时余量充足；须实测高水位）
+合计         ≈ 55 KB   （实测空闲 118,624 B / 最大连续块 106,496 B 时余量 ~63 KB；须实测高水位）
 ```
 
 ---
@@ -398,17 +432,27 @@ Ubuntu 侧在本机（洛杉矶）实测，作为 v1 的**参考基线**，不�
 
 ---
 
-## 14. 待签认清单（Windows Agent 请逐条给结论）
+## 14. 签认记录（FROZEN v1.0，2026-11-14）
 
-| 编号 | 决定 | Ubuntu 侧建议 | Windows 侧结论 |
-|---|---|---|---|
-| D1 | `turn_id` 由**服务端**分配，设备按下即录 300 ms pre-roll，收到 `capture.start` 才补发 | 采纳 | ☐ |
-| D2 | 音频口缺省 = `control_port + 1`，`set_net` 增加可选 `audio_port`、`get_net` 回显 | 采纳 | ☐ |
-| D3 | `device_id` = `psp-` + STA MAC 后 6 hex；密钥独立 provision，**不用 cardid** | 采纳 | ☐ |
-| D4 | 轮次身份 = `(session_id, turn_id)`；重连换 session，旧音频按 session 丢弃 | 采纳 | ☐ |
-| D5 | 上行无背压：有界 8 KB 积压 + 丢最旧帧 + `audio_overflow` 计数 | 采纳 | ☐ |
-| D6 | 20 ms / 640 B 为首选帧长；若 ES8311 DMA 只能 40 ms，则整条连接统一 1280 B 并在 `hello` 声明 | 由 Windows 实测后定 | ☐ |
-| D7 | 控制行上限维持 入 512 B / 出 2048 B；`scan` 装不下时 `truncated:true` + 真实 `count` | 采纳 | ☐ |
-| D8 | 认证：nonce + HMAC-SHA256 双向，无时间戳；服务端缓存 64 个 nonce 防重放 | 采纳 | ☐ |
+签认方：Windows Agent，载体 `docs/voice-protocol-v1-windows-signoff.md` @ `27c133f`；
+Ubuntu 侧本文件 @ `feat/passport-voice-ubuntu`。**D1–D8 全部同意，无 wire format 变更。**
 
-签认后本文件顶部状态改为 `FROZEN v1.0`，并记录签认日期与两侧 commit。
+| 编号 | 结论 | 备注 |
+|---|---|---|
+| D1 | ✅ 同意 | 300 ms pre-roll = 9,600 B，相对最大连续块 106,496 B 无压力 |
+| D2 | ✅ 同意 | NVS 命名空间 `dshtc`，Kconfig 默认 8080 → 音频 8081；`audio_port` 为新增 NVS 键 |
+| D3 | ✅ 同意（附部署事实） | `idf.py flash` 只写 app 分区，NVS 与密钥保留；**整片擦除 / 恢复 8 MB 备份会抹掉密钥，之后必须重新 `provision`** |
+| D4 | ✅ 同意 | 迟到帧按 `(session_id, turn_id)` 双条件丢弃 |
+| D5 | ✅ 同意（附边界） | 设备上行非阻塞 + 丢最旧 + 计数；**绝不为"不丢帧"扩大缓冲或阻塞采集线程** |
+| D6 | ✅ 定为 640 B | 真机实测见 §4 结案；40 ms 仅保留兼容，`hello` 不协商帧长 |
+| D7 | ✅ 同意（已实现并真机验证） | 错误码已逐字对齐 `bad_json`/`unknown_cmd`/`line_too_long`（原带空格）；`scan` 带 `truncated:true` |
+| D8 | ✅ 同意 | mbedTLS HMAC-SHA256，flash +8–10 KB；`esp_random()` 取 nonce，不依赖上电早期熵 |
+
+**签认时补充的两条协议口径**（已并入正文，不改字节）：
+
+1. `ready` 只在 `auth` 成功后发送（§6.4）——此前它与"认证前一律 `unauthorized`"直接冲突。
+2. `scan` / `set_net` 视为会话终止：两条通道同断、`session_id` 作废（§7.3）。
+
+**仍未实现、由 Windows 侧推进的部分**（不阻塞合同）：固件当前**没有任何 PAV1 帧**，
+已具备 JSONL 控制通道、Wi-Fi STA + 主动 TCP、codec 自测。真机端到端要等 W2-3 framer
+与 W2-4 上行 pre-roll 落地；在此之前 `mock_device.py` 只证明 Ubuntu 侧状态机，不证明固件。

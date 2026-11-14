@@ -36,6 +36,22 @@ cp server/config/example.json server/config/local.json   # 该文件已在 .giti
 python3 -m server --config server/config/local.json
 ```
 
+## 部署（本机现跑）
+
+```bash
+# 已在跑（LA 主机，公网 154.64.231.1）：
+#   control 18080 / audio 18081，asr+tts=百炼，brain=mock
+sudo cp deploy/passport-voice.service /etc/systemd/system/ && sudo systemctl enable --now passport-voice
+tail -f /tmp/passport-voice.log          # 当前用 nohup 起的那份
+```
+
+`server/config/local.json` 与 `server/config/*.env` 都在 `.gitignore` 里：前者放设备密钥路径，
+后者放 API key（systemd 用 `EnvironmentFile` 读）。
+
+**兼容模式**（协议 §11）：`allow_anonymous: true` 允许"不说 hello 的老固件"连进来，用于
+Windows 侧 W2-2（hello/auth）落地之前的控制通道联调。它不给音频、**不会**让任何第三方碰到
+真实设备的会话（匿名连接本身就是自己的会话），日志会以 WARNING 明确标出。正式部署关掉它。
+
 ## 跑测试
 
 ```bash
@@ -48,7 +64,8 @@ python3 protocol/v1/make_vectors.py --check              # 合同没被手改
 
 覆盖：20 轮连续对话不串音、打断、认证失败、未认证命令、超长行、音频通道垃圾字节、
 断线重连（新 session、turn 从 1 重开）、设备中途消失、主动播报、时延埋点、
-TTS→ASR 真实往返。
+TTS→ASR 真实往返；以及签认时补定的三条行为（auth 前事件忽略、`scan`/`set_net` 终止会话、
+`get_status` 透传真机 heap）。
 
 ## 设备侧怎么对接（给 Windows Agent 的最小信息）
 

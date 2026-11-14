@@ -21,6 +21,10 @@
       20,
       40
     ],
+    "frame_ms_used_by_v1_devices": [
+      20
+    ],
+    "frame_ms_negotiated_in_hello": false,
     "pre_roll_ms": 300,
     "prebuffer_ms": 300,
     "playback_ring_ms": 1200,

@@ -43,6 +43,11 @@ class Config:
     dsh_binary: str = "dsh"
     dsh_profile: str = "headless"
 
+    # Compatibility escape hatch (protocol §11): accept a control connection that
+    # never says hello, i.e. firmware from before W2-2. Dev only -- anonymous
+    # sessions get no audio and are logged loudly. Never enable on a public host.
+    allow_anonymous: bool = False
+
     # Protocol timers, from docs/voice-protocol-v1.md §8.
     hello_timeout: float = 5.0
     request_timeout: float = 5.0

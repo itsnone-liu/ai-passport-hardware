@@ -283,6 +283,8 @@ def build():
             "bytes_per_second": 32000,
             "frame_ms_preferred": 20,
             "frame_ms_allowed": [20, 40],
+            "frame_ms_used_by_v1_devices": [20],
+            "frame_ms_negotiated_in_hello": False,
             "pre_roll_ms": 300,
             "prebuffer_ms": 300,
             "playback_ring_ms": 1200,

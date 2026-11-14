@@ -30,3 +30,6 @@ server/config/devices/
 
 # local service config (holds real device secrets)
 server/config/local.json
+
+# service env with API keys
+server/config/*.env

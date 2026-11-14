@@ -219,12 +219,32 @@ class MockPassport:
         elif cmd == "show_text":
             await self._reply(msg)
         elif cmd == "get_status":
-            await self._reply(msg, battery=94, mv=4120, volume=60, brightness=80, uptime=1)
+            await self._reply(msg, battery=94, mv=4120, volume=60, brightness=80, uptime=1,
+                              # real board numbers after a full boot: these are
+                              # what the service should read, not estimate
+                              heap=118624, heap_min=113236, heap_block=106496,
+                              audio_ready=True)
+        elif cmd == "scan":
+            # Real hardware must disconnect the STA to scan, which drops both
+            # TCP channels. Reproduce that instead of answering politely.
+            await self._reply(msg, count=0, aps=[], truncated=False)
+            await self._kill_session()
+        elif cmd == "set_net":
+            await self._reply(msg, ok=True)
+            await self._kill_session()
         elif cmd == "get_net":
             await self._reply(msg, ssid="lab-5g", host="127.0.0.1", port=self.control_port,
                               password_set=True)
         else:
             await self._reply(msg)
+
+    async def _kill_session(self) -> None:
+        """What a STA rebuild looks like from the host side: both sockets die."""
+        await asyncio.sleep(0.02)
+        for w in (self.audio_writer, self.control_writer):
+            if w:
+                with contextlib.suppress(Exception):
+                    w.close()
 
     async def _emit(self, obj: dict) -> None:
         assert self.control_writer is not None

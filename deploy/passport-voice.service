@@ -1,0 +1,21 @@
+[Unit]
+Description=AI Passport voice service (control JSONL + PAV1 audio)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/dsh-ws/ai-passport-hardware
+Environment=PYTHONUNBUFFERED=1
+# TOKENPLAN_API_KEY / DEEPSEEK_API_KEY belong in this file, not in the unit:
+EnvironmentFile=-/root/dsh-ws/ai-passport-hardware/server/config/voice.env
+ExecStart=/usr/bin/python3 -m server --config server/config/local.json --log-level INFO
+Restart=on-failure
+RestartSec=3
+# The service holds device secrets only in memory and never writes audio to disk,
+# so a read-only-ish sandbox is cheap here.
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -287,6 +287,13 @@ class Session:
             return
 
         if msg.get("event"):
+            if not self.authed:
+                # ready used to be emitted on connect, i.e. before auth, which
+                # collided with "everything but hello/auth is unauthorized".
+                # Now ready arrives after auth; a stray event here is ignored
+                # (and must never start a turn) rather than counted as abuse.
+                log.debug("ignoring event before auth: %s", msg.get("event"))
+                return
             # Never await event handling inline: it issues requests whose replies
             # arrive on this very read loop, so awaiting would deadlock the link.
             asyncio.create_task(self.on_device_event(msg))
@@ -349,6 +356,24 @@ class Session:
             self._played_end.set()
         elif ev == "error":
             log.warning("device error: %s %s", msg.get("code"), msg.get("detail", ""))
+
+    def on_transport_lost(self, why: str = "transport lost") -> None:
+        """The peer disappeared (or killed the session deliberately).
+
+        scan/set_net make the device drop both sockets, so this is a normal path,
+        not an exception: end the turn, release every waiter, drop the queue.
+        """
+        log.info("%s: %s (state=%s turn=%s)", self.device_id, why, self.state,
+                 self.active_turn)
+        self._last_end_reason = "cancelled"
+        self._played_end.set()
+        self._capture_ended.set()
+        if self._pipeline_task and not self._pipeline_task.done():
+            self._pipeline_task.cancel()
+        if self._capture_task and not self._capture_task.done():
+            self._capture_task.cancel()
+        self.state = STATE_IDLE
+        self.active_turn = None
 
     async def report_error(self, code: str, detail: str = "") -> None:
         if self.control and not self.control.closed:
@@ -539,7 +564,27 @@ class Session:
                                           value=value)
 
     async def get_status(self) -> Dict[str, Any]:
+        """Includes the device's own heap numbers (heap/heap_min/heap_block).
+
+        Read them instead of estimating: the budget in the protocol was written
+        from an estimate that turned out ~50 KB optimistic.
+        """
         return await self.control.request("get_status", self.cfg.request_timeout)
+
+    async def scan(self) -> Dict[str, Any]:
+        """Diagnostic only. **Ends the session**: the device must disconnect the
+        STA to scan, which drops both TCP channels and invalidates session_id."""
+        if self.state != STATE_IDLE:
+            await self.cancel_playback()
+            await asyncio.sleep(0.05)
+        return await self.control.request("scan", timeout=15.0)
+
+    async def set_net(self, **fields: Any) -> Dict[str, Any]:
+        """Re-point the device. **Ends the session** for the same reason."""
+        if self.state != STATE_IDLE:
+            await self.cancel_playback()
+            await asyncio.sleep(0.05)
+        return await self.control.request("set_net", timeout=10.0, **fields)
 
     async def speak_notification(self, text: str) -> None:
         """dsh-initiated utterance: its own turn, same pipeline, no capture."""
@@ -644,6 +689,24 @@ class Service:
         try:
             first = await asyncio.wait_for(reader.readline(), timeout=self.cfg.hello_timeout)
             msg = json.loads(first.decode() or "{}")
+            if msg.get("cmd") != "hello" and self.cfg.allow_anonymous:
+                # Protocol §11 escape hatch: firmware that predates hello/auth can
+                # still be tested against the real service. No audio, no HMAC, and
+                # the log makes it obvious this is not a normal deployment.
+                peer = writer.get_extra_info("peername")
+                device_id = f"anon-{peer[0] if peer else 'unk'}".replace(".", "-")
+                log.warning("ANONYMOUS control session from %s (dev mode; no auth, no audio)",
+                            peer)
+                session = Session(self, device_id, secrets.token_hex(8))
+                link = ControlLink(session, reader, writer)
+                session.control = link
+                session.authed = True
+                link.authed = True
+                self.sessions[device_id] = session
+                self.by_session_id[session.session_id] = session
+                await session.on_control_line(link, first.decode().strip())
+                await link.read_loop()
+                return
             if msg.get("cmd") != "hello":
                 writer.write(b'{"id":0,"ok":false,"err":"hello_required"}\n')
                 await writer.drain()
@@ -677,6 +740,7 @@ class Service:
                 writer.close()
         finally:
             if session:
+                session.on_transport_lost("control channel closed")
                 # A reconnect replaces the registry entry; only remove our own.
                 if self.sessions.get(session.device_id) is session:
                     self.sessions.pop(session.device_id, None)

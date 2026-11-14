@@ -225,3 +225,132 @@ class TestServiceTeardown(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestSignedOffBehaviour(unittest.IsolatedAsyncioTestCase):
+    """The three things the Windows side corrected in the contract, as tests.
+
+    Sign-off is not a document edit: each clarification is a behaviour the
+    service must actually have, or the next round discovers the gap on hardware.
+    """
+
+    async def asyncSetUp(self):
+        self.svc = await make_service()
+        self.dev = MockPassport("127.0.0.1", self.svc.control_port, DEVICE, SECRET)
+        await self.dev.connect()
+
+    async def asyncTearDown(self):
+        await self.dev.close()
+        await self.svc.stop()
+
+    async def test_event_before_auth_is_ignored_not_counted(self):
+        """`ready` used to arrive pre-auth and would have been judged abuse."""
+        import hashlib
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.svc.control_port)
+        nonce = hashlib.sha256(b"ready-test").hexdigest()[:32]
+        writer.write((json.dumps({"id": 1, "cmd": "hello", "proto": "v1",
+                                  "device_id": DEVICE, "nonce": nonce}) + "\n").encode())
+        await writer.drain()
+        await reader.readline()
+        for _ in range(5):                       # five stray events, not three
+            writer.write(b'{"event":"ready","link":"net"}\n')
+        await writer.drain()
+        await asyncio.sleep(0.1)
+        # If they had counted as abuse the socket would be closed by now.
+        writer.write(b'{"id":9,"cmd":"state.set","state":"idle"}\n')
+        await writer.drain()
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 2))
+        self.assertFalse(reply["ok"])
+        self.assertEqual("unauthorized", reply["err"], "still connected, just unauthenticated")
+        writer.close()
+
+    async def test_scan_ends_the_session_and_next_connect_is_new(self):
+        """scan forces a STA disconnect: both sockets go, session_id dies."""
+        session = self.svc.session_of(DEVICE)
+        old_session_id = session.session_id
+        await session.scan()                     # answers, then the device drops away
+        for _ in range(100):
+            if self.svc.session_of(DEVICE) is None:
+                break
+            await asyncio.sleep(0.02)
+        self.assertIsNone(self.svc.session_of(DEVICE), "dead session must be reaped")
+
+        dev2 = MockPassport("127.0.0.1", self.svc.control_port, DEVICE, SECRET, name="post-scan")
+        await dev2.connect()
+        self.assertNotEqual(old_session_id, dev2.session_id)
+        result = await dev2.converse(UPLOAD)
+        self.assertGreater(len(result["audio"]), 0)
+        await dev2.close()
+
+    async def test_peer_vanishing_while_speaking_ends_the_turn(self):
+        """The device disappearing mid-playback is a normal ending, not a hang."""
+        session = self.svc.session_of(DEVICE)
+        await session.speak_notification("一段会被网络中断打断的播报")
+        await asyncio.wait_for(self.dev._playback_started.wait(), 5)
+        await self.dev.close()                   # yank the cable
+        for _ in range(100):
+            if self.svc.session_of(DEVICE) is None:
+                break
+            await asyncio.sleep(0.02)
+        self.assertIsNone(self.svc.session_of(DEVICE))
+        self.assertEqual(STATE_IDLE, session.state)
+        self.assertIsNone(session.active_turn)
+
+    async def test_get_status_carries_the_real_heap_numbers(self):
+        """The protocol's memory budget was ~50 KB optimistic; read, don't guess."""
+        session = self.svc.session_of(DEVICE)
+        status = await session.get_status()
+        self.assertEqual(118624, status["heap"])
+        self.assertEqual(106496, status["heap_block"])
+        self.assertLess(38400, status["heap_block"], "playback ring must fit one block")
+
+
+class TestLegacyFirmwareCompat(unittest.IsolatedAsyncioTestCase):
+    """Protocol §11: firmware from before hello/auth must still be testable.
+
+    The Windows side has the control channel working today but no handshake yet
+    (that is W2-2), so without this they cannot point a device at the real
+    service at all. It is opt-in, audio-less and loudly logged -- a debugging
+    aid, not a supported deployment.
+    """
+
+    async def test_anonymous_control_session_when_enabled(self):
+        svc = await make_service(allow_anonymous=True)
+        reader, writer = await asyncio.open_connection("127.0.0.1", svc.control_port)
+        # The session is created from the first line, so a legacy device speaks first.
+        writer.write(b'{"id":1,"cmd":"ping"}\n')
+        await writer.drain()
+        first = json.loads(await asyncio.wait_for(reader.readline(), 3))
+        self.assertFalse(first["ok"])
+        self.assertEqual("unknown_cmd", first["err"], "connected, just unauthenticated")
+
+        async def device():
+            """Answer one server request, the way real firmware would."""
+            line = await asyncio.wait_for(reader.readline(), 3)
+            msg = json.loads(line)
+            writer.write((json.dumps({"id": msg["id"], "ok": True,
+                                      "cmd": msg["cmd"], "battery": 94}) + "\n").encode())
+            await writer.drain()
+
+        task = asyncio.create_task(device())
+        for _ in range(100):
+            if svc.sessions:
+                break
+            await asyncio.sleep(0.01)
+        session = next(iter(svc.sessions.values()))
+        self.assertTrue(session.device_id.startswith("anon-"))
+        status = await session.get_status()
+        self.assertEqual(94, status["battery"])
+        await task
+        writer.close()
+        await svc.stop()
+
+    async def test_anonymous_is_refused_by_default(self):
+        svc = await make_service()
+        reader, writer = await asyncio.open_connection("127.0.0.1", svc.control_port)
+        writer.write(b'{"id":1,"cmd":"get_status"}\n')
+        await writer.drain()
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 3))
+        self.assertFalse(reply["ok"])
+        self.assertEqual("hello_required", reply["err"])
+        writer.close()
+        await svc.stop()
