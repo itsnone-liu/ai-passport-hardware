@@ -13,7 +13,9 @@
 #include "terminal_udp.h"
 
 #include "terminal_auth.h"
+#include "terminal_adpcm.h"
 #include "terminal_pav1.h"
+#include "terminal_playback.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -40,6 +42,7 @@ static volatile bool s_should_run;
 static volatile bool s_ready;      // 服务端 ack 过
 static volatile bool s_slow;        // ack 久等不到：降频重试，但不放弃
 static uint32_t s_sent, s_fail, s_acks, s_hello;
+static uint32_t s_down, s_bad;      // 下行收到的音频块 / 坏包
 static volatile int s_last_errno;
 static int64_t s_ack_ms;           // 首次 ack 的时刻（用于报告打洞耗时）
 static TaskHandle_t s_task;
@@ -89,22 +92,38 @@ static void send_hello(void) {
     if (w > 0) s_hello++;
 }
 
-// 收数据报：只在 ack 之前有用（等 kind=2），之后服务端不会再发。
-static void poll_ack(void) {
+// 收数据报：kind=2 是打洞 ack，kind=5 是下行音频块（服务端→设备）。
+// 下行也走同一条洞，所以这里两头都要认：只认 ack 的话，打通了也照样没声音。
+static void poll_rx(void) {
     uint8_t buf[256];
     for (;;) {
         const int r = recv(s_sock, buf, sizeof buf, MSG_DONTWAIT);
         if (r < UDP_HDR_LEN) return;
         if (memcmp(buf, "PAV1", 4) != 0) continue;
-        if (buf[4] != PAV1_K_HELLO) continue;
-        s_acks++;
-        if (!s_ready) {
-            s_ready = true;
-            s_slow = false;   // 通了就不再是"慢速重试"模式
-            s_ack_ms = esp_timer_get_time() / 1000;
-            ESP_LOGI(TAG, "UDP 打洞完成：服务端听得到我们了（%u 次 HELLO 后 ack）",
-                     (unsigned)s_hello);
+        if (buf[4] == PAV1_K_HELLO) {
+            s_acks++;
+            if (!s_ready) {
+                s_ready = true;
+                s_slow = false;   // 通了就不再是"慢速重试"模式
+                s_ack_ms = esp_timer_get_time() / 1000;
+                ESP_LOGI(TAG, "UDP 打洞完成：服务端听得到我们了（%u 次 HELLO 后 ack）",
+                         (unsigned)s_hello);
+            }
+            continue;
         }
+        if (buf[4] != PAV1_K_ADPCM) continue;
+        // 载荷 = [u32 seq][164 B 块]；块自带预测器和步长，丢一块只损失 20 ms。
+        const uint32_t len = (uint32_t)buf[12] | ((uint32_t)buf[13] << 8) |
+                             ((uint32_t)buf[14] << 16) | ((uint32_t)buf[15] << 24);
+        if (len != UDP_MAX_PAYLOAD || r < UDP_HDR_LEN + (int)len) {
+            s_bad++;
+            continue;
+        }
+        const uint32_t turn = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) |
+                              ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
+        int16_t pcm[ADPCM_SAMPLES];
+        adpcm_dec_block(buf + UDP_HDR_LEN + 4, pcm);
+        if (terminal_playback_push(turn, pcm, sizeof pcm)) s_down++;
     }
 }
 
@@ -126,7 +145,7 @@ static void udp_task(void *arg) {
                          (unsigned)s_hello);
             }
         }
-        poll_ack();
+        poll_rx();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
     s_task = NULL;
@@ -201,8 +220,8 @@ bool terminal_udp_send_adpcm(uint32_t turn, uint32_t seq, const uint8_t *blk, si
 void terminal_udp_diag(char *buf, size_t n) {
     snprintf(buf, n,
              "\"udp_ready\":%s,\"udp_sent\":%u,\"udp_fail\":%u,\"udp_ack\":%u,"
-             "\"udp_hello\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
+             "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
              terminal_udp_ready() ? "true" : "false", (unsigned)s_sent, (unsigned)s_fail,
-             (unsigned)s_acks, (unsigned)s_hello, s_slow ? "true" : "false",
+             (unsigned)s_acks, (unsigned)s_hello, (unsigned)s_down, (unsigned)s_bad, s_slow ? "true" : "false",
              s_last_errno, (long long)s_ack_ms);
 }
