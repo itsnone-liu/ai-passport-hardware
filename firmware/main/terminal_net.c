@@ -8,6 +8,7 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -27,7 +28,10 @@
 static const char *TAG = "net";
 
 #define LINE_MAX 512
-#define RETRY_MS 3000
+#define RETRY_MS 2400          // 首次重连间隔（处暑建议 2.4 s 起）
+#define RETRY_MAX_MS 30000     // 指数退避封顶
+#define IDLE_DROP_S 180        // 控制通道完全静默这么久就认为流已死，弃掉重拨
+#define LINK_OK_US (5 * 1000 * 1000)  // 连接活过 5 s 才算"真的连上了"
 #define CONNECT_TIMEOUT_S 5
 #define MAX_SCAN_APS 12   // 12 个够现场判断"2.4G 有没有这个 SSID"了
 #define NVS_NS "dshtc"
@@ -35,9 +39,14 @@ static const char *TAG = "net";
 static int s_sock = -1;
 static volatile bool s_connected;
 static volatile bool s_ip_ready;
+static volatile bool s_link_dead;  // tcp_sink 发现发不出去，交给 net_task 处理
 static volatile bool s_scanning;  // 扫描期间抑制自动重连，否则状态机抢不到扫描权
 static bool s_cfg_loaded;         // NVS 里的网络参数是否已读进内存
 static bool s_wifi_started;       // esp_wifi_start() 是否已执行
+static uint32_t s_retry_ms = RETRY_MS;
+static int s_retry_count;
+static int64_t s_last_rx_us;
+static int64_t s_conn_us;  // 本次连接建立的时刻：用来判断"连上就断"不算真连上
 static SemaphoreHandle_t s_tx_lock;
 static char s_line[LINE_MAX];
 static size_t s_line_len;
@@ -113,10 +122,44 @@ static void tcp_sink(const char *line, size_t len) {
     size_t off = 0;
     while (off < len) {
         const int w = send(s_sock, line + off, len - off, 0);
-        if (w <= 0) break;
+        if (w <= 0) {
+            // 发不出去就是链路已死。旧写法只 break，net_task 毫不知情，连接会一直
+            // 挂着"已连接"却什么也发不出去。标记出来交给 net_task 弃掉重拨。
+            s_link_dead = true;
+            break;
+        }
         off += (size_t)w;
     }
     xSemaphoreGive(s_tx_lock);
+}
+
+static void drop_link(const char *why);
+
+// 连接失败后的等待：2.4 s 起每次翻倍，封顶 30 s。服务端重启、路由器抖动的恢复时间
+// 不可预测，固定间隔会在长时间不可用时变成无意义的密集重试。
+static void backoff(void) {
+    s_retry_count++;
+    const uint32_t delay_ms = s_retry_ms;
+    if (s_retry_ms < RETRY_MAX_MS) s_retry_ms *= 2;
+    if (s_retry_ms > RETRY_MAX_MS) s_retry_ms = RETRY_MAX_MS;
+    ESP_LOGW(TAG, "第 %d 次重连，%u ms 后重试", s_retry_count, (unsigned)delay_ms);
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+}
+
+// 断线统一入口：丢弃链路，再决定是"快速重拨"还是"退避"。
+// 判据是这一条连接活了多久——能建立不等于可用。对端 accept 之后立刻 close、或者
+// 中间设备把流量吞掉，都会表现为"连上就断"；若每次成功都清零退避，就会变成
+// 2.4 s 一轮的永久快循环，把重试预算全烧在一条坏链路上。
+static void link_lost(const char *why) {
+    const int64_t lived = (s_conn_us > 0) ? (esp_timer_get_time() - s_conn_us) : 0;
+    drop_link(why);
+    if (lived > LINK_OK_US) {
+        s_retry_ms = RETRY_MS;  // 曾经用通过，回到快速重拨
+        s_retry_count = 0;
+    } else {
+        ESP_LOGW(TAG, "本次连接只活了 %d ms，按失败计", (int)(lived / 1000));
+    }
+    backoff();
 }
 
 static void drop_link(const char *why) {
@@ -230,6 +273,22 @@ static int dial(void) {
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // 交互按键要低延迟
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);  // 半死连接能被发现
 
+    // recv 必须有超时。NAT 映射过期后，路由器会把这条流静默丢掉：服务端早已
+    // close（对端停在 FIN-WAIT，因为 FIN 再也到不了设备），而设备这边的阻塞 recv
+    // 会永远等下去——表现是"Wi-Fi 连着、控制通道没了、也不重连"，一次重启服务就
+    // 能让设备静默到重启为止。2 s 一次的 EAGAIN 让心跳与死亡判断有地方落。
+    struct timeval rcv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof rcv);
+
+    // 尽快发现死链路：默认 keepalive 要 2 小时，等于没有。这三个参数依赖
+    // CONFIG_LWIP_TCP_KEEPALIVE，没开时 setsockopt 会失败，此时靠空闲超时兜底。
+    const int idle = 10, intvl = 5, cnt = 3;
+    if (setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle) != 0 ||
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof intvl) != 0 ||
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof cnt) != 0) {
+        ESP_LOGW(TAG, "keepalive 参数未生效（CONFIG_LWIP_TCP_KEEPALIVE 未开），靠空闲超时兜底");
+    }
+
     s_sock = s;
     return 0;
 }
@@ -237,30 +296,63 @@ static int dial(void) {
 static void net_task(void *arg) {
     (void)arg;
     char buf[256];
+    int no_ip_ticks = 0;
 
     for (;;) {
         if (!s_ip_ready) {
+            // 关联着却迟迟拿不到 IP（NAT/租约/DHCP 异常）同样是静默状态：不重试就永远不动。
+            // 60 s 还没有 IP 就主动断开重连一次，把决定权交回给驱动。
+            if (++no_ip_ticks >= 120) {
+                no_ip_ticks = 0;
+                ESP_LOGW(TAG, "60 s 没有 IP，强制重新关联");
+                esp_wifi_disconnect();
+                esp_wifi_connect();
+            }
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
+        no_ip_ticks = 0;
+
+        if (s_link_dead && s_connected) {
+            link_lost("send failed");
+            continue;
+        }
         if (!s_connected) {
+            s_link_dead = false;
             if (dial() == 0) {
                 s_connected = true;
                 s_line_len = 0;
+                s_rx_discard = false;
+                s_last_rx_us = esp_timer_get_time();
+                s_conn_us = s_last_rx_us;
                 ESP_LOGI(TAG, "已连上服务器 %s:%d", s_host, s_port);
                 terminal_link_send("{\"event\":\"ready\",\"link\":\"net\"}\n");
             } else {
-                vTaskDelay(pdMS_TO_TICKS(RETRY_MS));
+                backoff();
             }
             continue;
         }
+
         const int n = recv(s_sock, buf, sizeof buf, 0);
-        if (n <= 0) {
-            drop_link("peer closed");
-            vTaskDelay(pdMS_TO_TICKS(RETRY_MS));
-        } else {
+        if (n > 0) {
+            s_last_rx_us = esp_timer_get_time();
             feed(buf, n);
+            continue;
         }
+        if (n == 0) {
+            // 对端主动 close：立刻重拨，不要等 Wi-Fi 事件（服务器重启时根本不会有）。
+            link_lost("peer closed");
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 2 s 无数据是正常的；长时间完全静默说明这条流已经死了（NAT 超时、对端僵死），
+            // 这种连接不会自己恢复，只能弃掉重拨。
+            if (esp_timer_get_time() - s_last_rx_us > IDLE_DROP_S * 1000000LL) {
+                link_lost("idle timeout");
+            }
+            continue;
+        }
+        link_lost("recv error");
     }
 }
 
