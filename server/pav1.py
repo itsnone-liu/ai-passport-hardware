@@ -27,6 +27,8 @@ import struct
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from server import adpcm
+
 MAGIC = b"PAV1"
 HEADER_BYTES = 16
 MAX_PAYLOAD = 4096
@@ -35,7 +37,10 @@ KIND_PCM = 1
 KIND_HELLO = 2
 KIND_END = 3
 KIND_AUTH = 4
-KINDS = (KIND_PCM, KIND_HELLO, KIND_END, KIND_AUTH)
+# 5 = IMA/DVI ADPCM 上行：payload = [u32 seq][4 B 块头][160 B 半字节]，
+# 20 ms / 块 168 B = 8.2 KB/s。设备侧理由见 docs/voice-protocol-v1.md §5.4。
+KIND_ADPCM = 5
+KINDS = (KIND_PCM, KIND_HELLO, KIND_END, KIND_AUTH, KIND_ADPCM)
 
 SAMPLE_RATE = 16000
 BYTES_PER_SECOND = SAMPLE_RATE * 2          # pcm_s16le mono
@@ -77,7 +82,8 @@ class Frame:
     @property
     def kind_name(self) -> str:
         return {KIND_PCM: "PCM", KIND_HELLO: "HELLO", KIND_END: "END",
-                KIND_AUTH: "AUTH"}.get(self.kind, f"KIND_{self.kind}")
+                KIND_AUTH: "AUTH", KIND_ADPCM: "ADPCM"}.get(
+                    self.kind, f"KIND_{self.kind}")
 
     def json(self) -> Optional[dict]:
         """Decode a HELLO/AUTH payload; None when the frame is not JSON-bearing."""
@@ -132,6 +138,10 @@ class Framer:
                 raise Pav1Error("OVERSIZE", f"payload_len={payload_len}")
             if kind not in KINDS:
                 raise Pav1Error("UNKNOWN_KIND", f"kind={kind}")
+            if kind == KIND_ADPCM and payload_len != adpcm.PAYLOAD_BYTES:
+                raise Pav1Error(
+                    "BAD_FRAME", f"adpcm payload_len={payload_len}"
+                )
             if kind == KIND_PCM and payload_len == 0:
                 raise Pav1Error("BAD_FRAME", "pcm with empty payload")
             if kind == KIND_END and payload_len != 0:
