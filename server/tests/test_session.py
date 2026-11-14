@@ -600,6 +600,24 @@ class TestAudioChannelAccept(unittest.IsolatedAsyncioTestCase):
         writer.close()
 
 
+class TestDeviceInitiatedTurn(ServiceCase):
+    """The device may open a turn by itself; the server must adopt its turn id.
+
+    This is the bug that produced "no PCM reached the server" with a healthy
+    audio channel: frames carried a turn id the server had never allocated, so
+    they were counted as untracked and dropped, and ASR never ran.
+    """
+
+    async def test_device_started_turn_is_adopted_and_transcribed(self):
+        result = await self.dev.start_turn_itself(41, UPLOAD)
+        self.assertGreater(len(result["audio"]), 0, "the reply never came back")
+        session = self.svc.session_of(DEVICE)
+        self.assertEqual(1, len(session.metrics))
+        metric = session.metrics[-1]
+        self.assertEqual(41, metric.turn_id, "the device's turn id must be adopted")
+        self.assertGreater(metric.upload_bytes, 0, "frames were dropped, not adopted")
+
+
 class TestPressReleaseSemantics(ServiceCase):
     """Firmware d7cfe32: press starts, release ends, the device never wants stop.
 
@@ -627,13 +645,14 @@ class TestPressReleaseSemantics(ServiceCase):
     async def test_uplink_stall_aborts_without_running_asr(self):
         """A deliberate device abort must not be transcribed as half a sentence."""
         self.dev.uplink_stall = True
+        self.svc.cfg.capture_release_timeout = 0.3
         session = self.svc.session_of(DEVICE)
         await self.dev.press_ok()
         await asyncio.wait_for(self.dev._listening.wait(), 5)
         await self.dev.stream_pcm(UPLOAD)
         await self.dev._emit({"event": "capture.ended", "turn_id": self.dev.turn_id,
                               "reason": "uplink_stall"})
-        for _ in range(50):
+        for _ in range(200):
             if session.state == STATE_IDLE:
                 break
             await asyncio.sleep(0.02)

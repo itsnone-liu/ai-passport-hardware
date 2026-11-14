@@ -350,6 +350,29 @@ class MockPassport:
                 await asyncio.sleep(pace)
         await self.audio_writer.drain()
 
+    async def start_turn_itself(self, turn_id: int, pcm: bytes,
+                               timeout: float = 10.0) -> dict:
+        """The device opens a turn on its own key press (firmware d7cfe32).
+
+        No capture.start from the server: the device decides the turn id and
+        starts streaming. The server must adopt that id, not reject the frames
+        as "a turn I never asked for".
+        """
+        self.turn_id = turn_id
+        self.state = "listening"
+        self.captured_frames = 0
+        self._playback_ended.clear()
+        self.playback = bytearray()
+        await self._emit({"event": "capture.started", "turn_id": turn_id,
+                          "pre_roll_ms": 300})
+        await self.stream_pcm(pcm)
+        await self._send_end()
+        await self._emit({"event": "capture.ended", "turn_id": turn_id,
+                          "reason": "released", "frames": self.captured_frames,
+                          "dropped": 0, "rms": 900, "peak": 4000})
+        await asyncio.wait_for(self._playback_ended.wait(), timeout)
+        return {"turn_id": turn_id, "audio": bytes(self.playback)}
+
     async def converse(self, pcm: bytes, timeout: float = 10.0) -> dict:
         """One full round: press, speak, release, listen to the answer."""
         self._listening.clear()

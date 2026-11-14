@@ -223,6 +223,7 @@ class AudioLink:
         try:
             while True:
                 chunk = await self.reader.read(4096)
+                log.debug("%s audio read %d bytes", self.session.device_id, len(chunk or b""))
                 if not chunk:
                     break
                 try:
@@ -243,6 +244,8 @@ class AudioLink:
         elif frame.kind == pav1.KIND_AUTH:
             await self.session.on_audio_auth(self, frame.json() or {})
         elif frame.kind == pav1.KIND_PCM:
+            log.debug("%s audio frame turn=%d len=%d authed=%s", self.session.device_id,
+                      frame.turn_id, len(frame.payload), self.authed)
             if not self.authed:
                 await self.session.report_error("not_authed", "pcm before auth")
                 return
@@ -294,6 +297,16 @@ class Session:
         self.probe_bytes = 0
         self.probe_last_turn = 0
         self.probe_end_frames = 0
+        self._rx_frames = 0
+        self._rx_bytes = 0
+        self._rx_log_t0 = 0.0
+        self._audio_end = asyncio.Event()
+        # Frames can arrive before capture.started: the device flushes its
+        # pre-roll the instant it starts, while the control event is still in
+        # flight. Dropping those loses exactly the 300 ms the pre-roll exists to
+        # preserve, so hold them until a turn claims them.
+        self._pending_pcm: Dict[int, bytearray] = {}
+        self._pending_since: Dict[int, float] = {}
         self._pace_t0: Optional[float] = None
         self._pace_log_t0: Optional[float] = None
         self._max_send_block = 0.0
@@ -418,11 +431,30 @@ class Session:
             await self.on_key(str(msg.get("btn", "")), str(msg.get("ev", "")))
         elif ev == "capture.started":
             # pre_roll_ms is the *measured* pre-roll, 0 when there was nothing to
-            # replay (straight capture.start with no key press). Reporting a
-            # nominal 300 would make the server expect audio that never existed.
+            # replay. Reporting a nominal 300 would make the server expect audio
+            # that never existed.
             self.last_pre_roll_ms = int(msg.get("pre_roll_ms", -1))
+            # The device owns turn ids: it can start a turn by itself on a key
+            # press. Adopting its id is what makes those frames land in the
+            # pipeline instead of being dropped as "no such turn" -- the bug that
+            # cost one round of "no PCM reached the server".
+            dev_turn = msg.get("turn_id")
+            if dev_turn is not None and int(dev_turn) != self.active_turn:
+                log.info("%s adopting device turn %s (server had %s)", self.device_id,
+                         dev_turn, self.active_turn)
+            self.active_turn = int(dev_turn) if dev_turn is not None else self.active_turn
+            early = self._pending_pcm.pop(self.active_turn, None)
+            if early:
+                self._capture_buf += early
+                self._pending_since.pop(self.active_turn, None)
+                log.info("%s claimed %d bytes of pre-arrival audio for turn %d",
+                         self.device_id, len(early), self.active_turn)
+            if self.state in (STATE_IDLE, STATE_LISTENING):
+                self.state = STATE_LISTENING
+                if self._capture_ended.is_set():
+                    self._capture_ended = asyncio.Event()
             log.info("%s capture.started turn=%s pre_roll_ms=%s", self.device_id,
-                     msg.get("turn_id"), self.last_pre_roll_ms)
+                     self.active_turn, self.last_pre_roll_ms)
         elif ev == "capture.ended":
             self._last_capture_reason = str(msg.get("reason", "")) or "released"
             if "frames" in msg:
@@ -499,6 +531,15 @@ class Session:
         await link.send_json(pav1.KIND_HELLO, {"ok": True})
 
     def on_uplink_pcm(self, turn_id: int, payload: bytes) -> None:
+        now = time.monotonic()
+        if self.active_turn == turn_id and self.state == STATE_LISTENING:
+            self._rx_frames += 1
+            self._rx_bytes += len(payload)
+            if now - self._rx_log_t0 >= 1.0:
+                self._rx_log_t0 = now
+                log.info("%s uplink turn=%d %d frames / %d bytes (%.2f s)",
+                         self.device_id, turn_id, self._rx_frames, self._rx_bytes,
+                         self._rx_bytes / 32000)
         if self.active_turn != turn_id or self.state != STATE_LISTENING:
             if self.cfg.dev_audio_probe:
                 # W2-3 hands us frames before capture.start exists. Count them so
@@ -514,6 +555,17 @@ class Session:
                     log.info("%s uplink probe: %d frames / %d bytes (turn %d, %.2f s)",
                              self.device_id, self.probe_frames, self.probe_bytes,
                              turn_id, self.probe_bytes / 32000)
+            else:
+                # Unknown turn: keep a bounded pre-roll, drop the rest.
+                buf = self._pending_pcm.setdefault(turn_id, bytearray())
+                log.debug("%s parking %d bytes for unclaimed turn %d", self.device_id,
+                          len(payload), turn_id)
+                if len(buf) < 32000 * 2:          # at most 2 s held per turn
+                    buf += payload
+                    self._pending_since.setdefault(turn_id, now)
+                if now - self._pending_since.setdefault(turn_id, now) > 5.0:
+                    self._pending_pcm.pop(turn_id, None)
+                    self._pending_since.pop(turn_id, None)
             return
         if len(self._capture_buf) + len(payload) > self.cfg.max_capture_bytes:
             overflow = len(self._capture_buf) + len(payload) - self.cfg.max_capture_bytes
@@ -522,6 +574,15 @@ class Session:
         self._capture_buf += payload
 
     async def on_uplink_end(self, turn_id: int) -> None:
+        if self.active_turn == turn_id:
+            # The audio stream is self-delimiting: PCM* END. The control-channel
+            # event can arrive before, after, or interleaved with it, so the END
+            # frame -- not the event -- is what closes the turn.
+            self._audio_end.set()
+            log.info("%s audio END for turn %d (%d bytes buffered)", self.device_id,
+                     turn_id, len(self._capture_buf))
+            if self.active_turn == turn_id and self.state == STATE_LISTENING:
+                asyncio.create_task(self.end_capture("released"))
         if self.active_turn != turn_id or self.state != STATE_LISTENING:
             if self.cfg.dev_audio_probe:
                 # Firmware drove capture.start itself (USB) so this link never
@@ -546,6 +607,7 @@ class Session:
         if btn != "ok":
             return
         if ev == "press":
+            log.info("%s key press (state=%s)", self.device_id, self.state)
             if self.state == STATE_IDLE:
                 await self.begin_capture()
             elif self.state == STATE_SPEAKING:
@@ -553,6 +615,7 @@ class Session:
             else:
                 await self.report_error("busy", f"state={self.state}")
         elif ev == "release":
+            log.info("%s key release (state=%s)", self.device_id, self.state)
             if self.state == STATE_LISTENING:
                 await self.end_capture("released")
 
@@ -565,8 +628,12 @@ class Session:
         self._capture_buf = bytearray()
         self._capture_dropped = 0
         self._capture_ended = asyncio.Event()
+        self._audio_end = asyncio.Event()
         self._cancel = asyncio.Event()
+        log.info("%s capture.start turn=%d sent (audio_link=%s)", self.device_id,
+                 self.active_turn, bool(self.audio and self.audio.authed))
         reply = await self._capture_start(self.active_turn)
+        log.info("%s capture.start reply: %s", self.device_id, reply)
         if not reply.get("ok"):
             # busy == the audio channel is still dialling: retry is right.
             # Anything else (not_supported, error) means retrying is pointless.
@@ -586,13 +653,17 @@ class Session:
         window is answered `busy`. Treating that as fatal would abandon a
         perfectly good device at the one moment it was about to become ready.
         """
+        # not_supported (audio channel still dialling), busy (previous turn closing)
+        # and no_mem (device heap pressure) are all transient: retrying is right.
+        # Treating any of them as fatal abandons a healthy device mid-handshake.
+        retryable = {"busy", "not_supported", "no_mem"}
         for attempt in range(attempts):
             reply = await self.control.request("capture.start", self.cfg.request_timeout,
                                                turn_id=turn_id)
-            if reply.get("ok") or reply.get("err") != "busy":
+            if reply.get("ok") or reply.get("err") not in retryable:
                 return reply
-            log.info("%s capture.start busy (attempt %d/%d), retrying in %.0f ms",
-                     self.device_id, attempt + 1, attempts, delay * 1000)
+            log.info("%s capture.start %s (attempt %d/%d), retrying in %.0f ms",
+                     self.device_id, reply.get("err"), attempt + 1, attempts, delay * 1000)
             await asyncio.sleep(delay)
         return {"ok": False, "err": "busy"}
 
@@ -604,13 +675,17 @@ class Session:
                 await self.end_capture(reason="max_duration")
 
     async def end_capture(self, reason: str = "released") -> None:
-        """Close the turn. The device already sent its END + capture.ended.
+        """Close the turn: wait for the device's ending, then drain the audio.
 
-        Order matters: waiting for capture.ended first keeps the two firmwares
-        compatible for one release cycle. New firmware ends the turn on release
-        and never wants `capture.stop` (it answers `turn_closed`); old firmware
-        only stops when asked. Waiting a short beat costs nothing and avoids
-        pinning the project to one build.
+        Two different sockets are in play and they race. `capture.ended` rides
+        the control channel; the PCM and the in-band END ride the audio channel.
+        Control routinely arrives first, so:
+          1. wait for capture.ended (with a legacy fallback to capture.stop),
+          2. keep LISTENING and wait for the audio END frame -- it is the only
+             proof that every byte queued for this turn has been read,
+          3. only then flip to PROCESSING and hand the buffer to ASR.
+        Getting (2) and (3) the wrong way round turned a complete sentence into
+        an empty transcript, which then looked like a broken ASR.
         """
         if self.state != STATE_LISTENING:
             return
@@ -618,26 +693,34 @@ class Session:
             self._capture_task.cancel()
             self._capture_task = None
         turn = self.active_turn
-        self.state = STATE_PROCESSING
 
-        if not self._capture_ended.is_set():
+        # Wait for the audio END (the authoritative end-of-turn marker) while
+        # still LISTENING so late frames are not dropped. capture.ended may come
+        # earlier or later; only its `reason` matters here.
+        if not self._audio_end.is_set():
             try:
-                await asyncio.wait_for(self._capture_ended.wait(),
+                await asyncio.wait_for(self._audio_end.wait(),
                                        self.cfg.capture_release_timeout)
             except asyncio.TimeoutError:
-                log.warning("%s no capture.ended after %.1fs; falling back to "
-                            "capture.stop (legacy firmware)", self.device_id,
-                            self.cfg.capture_release_timeout)
-                with contextlib.suppress(Exception):
-                    await self.control.request("capture.stop", self.cfg.request_timeout,
-                                               turn_id=turn)
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(self._capture_ended.wait(), 2.0)
+                log.warning("%s no audio END for turn %s within %.1fs; using %d bytes",
+                            self.device_id, turn, self.cfg.capture_release_timeout,
+                            len(self._capture_buf))
+                if not self._capture_ended.is_set():
+                    # Legacy firmware: it only sends END when asked.
+                    with contextlib.suppress(Exception):
+                        await self.control.request("capture.stop",
+                                                   self.cfg.request_timeout, turn_id=turn)
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(self._audio_end.wait(), 2.0)
 
+        self.state = STATE_PROCESSING
         reason = self._last_capture_reason or reason
+        if reason == "heap_guard":
+            log.warning("%s device ended the turn on its heap guard (%d frames); "
+                        "processing what arrived", self.device_id, len(self._capture_buf))
         if reason in ("uplink_stall", "cap_start_timeout"):
-            # The device aborted deliberately; running ASR on a truncated buffer
-            # would transcribe half a sentence and look like an ASR bug.
+            # The device aborted deliberately; transcribing a truncated buffer
+            # produces plausible text and looks like an ASR defect.
             await self.report_error(reason, f"turn {turn}")
             await self._to_idle(turn)
             return
