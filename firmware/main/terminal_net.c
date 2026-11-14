@@ -18,6 +18,8 @@
 #include "nvs_flash.h"
 #include "terminal_link.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,7 @@ static const char *TAG = "net";
 
 #define LINE_MAX 512
 #define RETRY_MS 3000
+#define CONNECT_TIMEOUT_S 5
 #define NVS_NS "dshtc"
 
 static int s_sock = -1;
@@ -158,12 +161,48 @@ static int dial(void) {
         freeaddrinfo(res);
         return -1;
     }
-    if (connect(s, res->ai_addr, res->ai_addrlen) != 0) {
+
+    // 非阻塞 connect + select 超时。阻塞式 connect 在"对端丢包/被防火墙静默丢弃"
+    // 时会一直卡在 SYN 重传里（几十秒到两分钟），任务挂住且不报错，现场只能看到
+    // 设备一片沉默。宁可显式失败，也不要无声地卡住。
+    const int flags = fcntl(s, F_GETFL, 0);
+    fcntl(s, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = connect(s, res->ai_addr, res->ai_addrlen);
+    if (rc != 0 && errno != EINPROGRESS) {
+        ESP_LOGW(TAG, "连接 %s:%d 失败 errno=%d", s_host, s_port, errno);
         close(s);
         freeaddrinfo(res);
         return -1;
     }
+    if (rc != 0) {
+        fd_set wf;
+        FD_ZERO(&wf);
+        FD_SET(s, &wf);
+        struct timeval tv = { .tv_sec = CONNECT_TIMEOUT_S, .tv_usec = 0 };
+        if (select(s + 1, NULL, &wf, NULL, &tv) <= 0) {
+            ESP_LOGW(TAG, "连接 %s:%d 超时（%d s）", s_host, s_port, CONNECT_TIMEOUT_S);
+            close(s);
+            freeaddrinfo(res);
+            return -1;
+        }
+        int so_err = 0;
+        socklen_t len = sizeof so_err;
+        getsockopt(s, SOL_SOCKET, SO_ERROR, &so_err, &len);
+        if (so_err != 0) {
+            ESP_LOGW(TAG, "连接 %s:%d 失败 errno=%d", s_host, s_port, so_err);
+            close(s);
+            freeaddrinfo(res);
+            return -1;
+        }
+    }
     freeaddrinfo(res);
+
+    fcntl(s, F_SETFL, flags);  // 恢复阻塞模式供 recv 使用
+    const int one = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // 交互按键要低延迟
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);  // 半死连接能被发现
+
     s_sock = s;
     return 0;
 }

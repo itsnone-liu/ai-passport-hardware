@@ -113,8 +113,15 @@ static int int_field(const cJSON *root, const char *name, int dflt) {
 void terminal_link_dispatch(char *line) {
     if (!line || !*line) return;
 
+    // 只处理以 '{' 开头的行。接到的可能不是我们自己人：路由器/HTTP 网关/任何误连上来
+    // 的东西都会往 socket 里写非 JSON 字节，若逐行回 "bad json" 就会变成回复风暴，
+    // 把链路彻底淹掉。协议一致规定：不像 JSON 的行直接丢掉。
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line != '{') return;
+
     cJSON *root = cJSON_Parse(line);
     if (!root) {
+        // 以 '{' 开头却解析失败，多半是真正想调命令却拼错了，此时报错才有助于调试。
         terminal_link_send("{\"ok\":false,\"err\":\"bad json\"}\n");
         return;
     }

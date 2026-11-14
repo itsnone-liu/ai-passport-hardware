@@ -65,13 +65,14 @@ def pump(conn, addr, lock):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18080)
+    ap.add_argument("--bind", default="0.0.0.0", help="address to listen on")
     args = ap.parse_args()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("127.0.0.1", args.port))
+    srv.bind((args.bind, args.port))
     srv.listen(4)
-    print(f"[srv] listening on 127.0.0.1:{args.port}", flush=True)
+    print(f"[srv] listening on {args.bind}:{args.port}", flush=True)
     lock = threading.Lock()
     while True:
         conn, addr = srv.accept()

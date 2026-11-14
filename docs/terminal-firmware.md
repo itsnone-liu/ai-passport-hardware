@@ -281,6 +281,37 @@ I (4137) net: 拿到 IP 192.168.2.107
 
 Credentials are stored in NVS only; they are deliberately absent from this repository.
 
+### Two bugs the real network exposed
+
+Emulation never showed either of these, because the emulator's LAN always accepts connections
+and never writes non-JSON bytes. Both were found within minutes of pointing the device at a
+real host.
+
+**1. A blocked port made the device go silent.** Windows Firewall silently drops inbound SYNs;
+a blocking `connect()` then sits in SYN retransmission for tens of seconds. The device printed
+nothing at all — indistinguishable from a hang. `connect()` is now non-blocking with a 5 s
+`select()` deadline, and every failure is logged with its errno:
+
+```
+I (7354) net: 已连上服务器 192.168.2.1:80          (works)
+W (9210) net: 连接 192.168.2.108:18080 超时（5 s）  (silently dropped)
+W (17214) net: 连接 192.168.2.108:18080 超时（5 s）
+```
+
+`TCP_NODELAY` and `SO_KEEPALIVE` are set for the same reason they matter to any terminal:
+key presses must not wait on Nagle, and a half-dead peer must eventually be noticed.
+
+**2. A non-JSON peer caused a reply storm.** Pointed at the LAN gateway's HTTP port, the router
+answered with HTTP bytes; the device treated every line as a command and answered
+`{"ok":false,"err":"bad json"}` dozens of times per connection, drowning the link. The protocol
+already told hosts to ignore lines that do not start with `{` — the device now applies the same
+rule in the other direction: anything not starting with `{` is dropped silently, and only a line
+that *does* start with `{` and still fails to parse gets an error reply. Verified after the fix:
+0 `bad json` lines over a 15 s capture against the same HTTP port.
+
+This also keeps the USB transport clean, because ESP-IDF log output shares the USB-Serial/JTAG
+stream with the protocol.
+
 Note: `rst:0x15 (USB_UART_CHIP_RESET)` in a capture is the host's DTR/RTS pulse resetting the
 chip, not a crash. On ESP32-C3 the USB-Serial/JTAG peripheral lives in ROM, so this is also the
 reason firmware can always be recovered over USB.
