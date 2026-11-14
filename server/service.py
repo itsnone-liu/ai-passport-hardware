@@ -185,6 +185,21 @@ class AudioLink:
         self.authed = False
         self.closed = False
         self._write_lock = asyncio.Lock()
+        self._cap_send_buffer()
+
+    def _cap_send_buffer(self) -> None:
+        """Keep the kernel from lying to us about how far ahead we are.
+
+        With the default (often 64 KB+) send buffer, writing 30 KB of PCM
+        returns instantly while the frames sit in local memory; the device only
+        ever sees ~its receive window. Pacing that believes its own send buffer
+        is pacing a queue nobody is reading.
+        """
+        sock = self.writer.get_extra_info("socket")
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16 * 1024)
 
     async def send_frame(self, kind: int, turn_id: int, payload: bytes = b"") -> None:
         if self.closed:
