@@ -39,6 +39,10 @@ void terminal_net_kill(const char *why);
 // 把当前配置写成 JSON 片段（不含密码），形如 "ssid":"..","host":"..","port":8080
 void terminal_net_describe(char *buf, size_t n);
 
+// 三层现场诊断（Wi-Fi 关联 / IP / 重连计数）+ 堆分区统计，输出为 JSON 片段。
+// 存在的理由：这些层混在一个"连接超时"里时，任何结论都只能是猜的。
+void terminal_net_diag(char *buf, size_t n);
+
 // 音频通道要用同一台服务器，所以这两个只读 getter 必须存在（端口由 hello 应答另给）。
 const char *terminal_net_host(void);
 int terminal_net_port(void);

@@ -6,6 +6,7 @@
 #include "terminal_net.h"
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_timer.h"
@@ -143,6 +144,18 @@ static void drop_link(const char *why);
 // 不可预测，固定间隔会在长时间不可用时变成无意义的密集重试。
 static void backoff(void) {
     s_retry_count++;
+    // 自愈：重连连续失败多次，且堆已经被压到连一次 TCP 握手都摆不开的时候，
+    // 再退避下去只是让用户盯着一块砖。实测场景是对端不读音频 → 上行把堆吃光
+    // → 控制通道 5 s 连接超时 → 退避 4.8/9.6/19.2 s 永远连不上，堆停在 4.9 KB、
+    // 最大可用块只剩 1.5 KB，此时除了重启没有任何出路。主动重启比等用户拔电源快。
+    const size_t free_now =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (s_retry_count >= 4 && free_now < 6 * 1024) {
+        ESP_LOGE(TAG, "连续 %d 次重连失败且堆仅剩 %u 字节，重启自愈", s_retry_count,
+                 (unsigned)free_now);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_restart();
+    }
     const uint32_t delay_ms = s_retry_ms;
     if (s_retry_ms < RETRY_MAX_MS) s_retry_ms *= 2;
     if (s_retry_ms > RETRY_MAX_MS) s_retry_ms = RETRY_MAX_MS;
@@ -552,6 +565,46 @@ static size_t json_escape(char *dst, size_t dstn, const char *src) {
     }
     dst[w] = '\0';
     return w;
+}
+
+// 现场诊断：把"为什么连不上"拆成三层——Wi-Fi 关联 / IP 层 / TCP 层，外加堆分区。
+// 这三层混在一个"连接超时"里的时候，任何结论都是猜的。
+void terminal_net_diag(char *buf, size_t n) {
+    if (!buf || n < 32) return;
+
+    wifi_ap_record_t ap;
+    const bool wifi_up = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+    char bssid[18] = "";
+    int rssi = 0, chan = 0;
+    if (wifi_up) {
+        snprintf(bssid, sizeof bssid, "%02x:%02x:%02x:%02x:%02x:%02x", ap.bssid[0], ap.bssid[1],
+                 ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
+        rssi = ap.rssi;
+        chan = ap.primary;
+    }
+
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_ip_info_t ip;
+    memset(&ip, 0, sizeof ip);
+    const bool ip_up = sta && esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0;
+
+    // 堆分区分开统计：INTERNAL 里 8bit 可分配块才是真正决定"还能不能建 socket"的数。
+    multi_heap_info_t in_info, d_info;
+    heap_caps_get_info(&in_info, MALLOC_CAP_INTERNAL);
+    heap_caps_get_info(&d_info, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    snprintf(buf, n,
+             "\"wifi_up\":%s,\"rssi\":%d,\"channel\":%d,\"bssid\":\"%s\","
+             "\"ip_up\":%s,\"ip\":\"" IPSTR "\",\"gw\":\"" IPSTR "\",\"netmask\":\"" IPSTR "\","
+             "\"ip_ready\":%s,\"net_ready\":%s,\"retry_count\":%d,"
+             "\"heap_internal_free\":%u,\"heap_internal_largest\":%u,"
+             "\"heap_internal_min\":%u,\"heap_8bit_free\":%u,\"heap_8bit_largest\":%u",
+             wifi_up ? "true" : "false", rssi, chan, bssid, ip_up ? "true" : "false",
+             IP2STR(&ip.ip), IP2STR(&ip.gw), IP2STR(&ip.netmask),
+             terminal_net_ip_ready() ? "true" : "false", terminal_net_ready() ? "true" : "false",
+             s_retry_count, (unsigned)in_info.total_free_bytes,
+             (unsigned)in_info.largest_free_block, (unsigned)in_info.minimum_free_bytes,
+             (unsigned)d_info.total_free_bytes, (unsigned)d_info.largest_free_block);
 }
 
 void terminal_net_describe(char *buf, size_t n) {

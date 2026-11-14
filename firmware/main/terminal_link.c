@@ -20,6 +20,10 @@
 #include "terminal_capture.h"
 #include "terminal_playback.h"
 #include "terminal_ui.h"
+#include "bsp_button.h"
+
+// 定义在 terminal_main.c：把一次按键塞进真实按键队列（vendor.key 用）。
+void terminal_app_key_inject(int btn, int ev);
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -391,6 +395,11 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
                       (unsigned)turn);
         } else if (err == ESP_ERR_INVALID_STATE) {
             reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.start\",\"err\":\"busy\"}\n", id);
+        } else if (err == ESP_ERR_NO_MEM) {
+            // 堆不够就别开轮：开了也只会把控制通道一起饿死，那比直接拒绝糟得多。
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.start\",\"err\":\"no_mem\","
+                      "\"detail\":\"heap below guard\"}\n", id);
         } else {
             reply_fmt(reply,
                       "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.start\",\"err\":\"not_supported\","
@@ -570,23 +579,43 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.crash\",\"note\":\"rebooting\"}\n", id);
         vTaskDelay(pdMS_TO_TICKS(150));  // 让回执先发出去，否则对面只看到连接断开
         abort();
+    } else if (strcmp(c, "vendor.net_state") == 0) {
+        // 厂商扩展：为什么连不上？把三层拆开答，不要再用"连接超时"一句话盖住全部。
+        static char diag[640];
+        terminal_net_diag(diag, sizeof diag);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.net_state\",%s}\n", id, diag);
     } else if (strcmp(c, "vendor.capture_arm") == 0) {
         // 厂商扩展：按键起采的等价入口，用来在没有人在设备旁边时验证 pre-roll。
         terminal_capture_arm();
         reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.capture_arm\"}\n", id);
+    } else if (strcmp(c, "vendor.key") == 0) {
+        // 厂商扩展：注入一次按键，走真实的按键队列（key_task 会照常上报并分发）。
+        // btn: ok/up/down   ev: press/release/click/double/long
+        // 存在的理由：press/release 语义只能靠手指验，而人手不一定随时在设备旁边；
+        // 这条命令能把"按键之后的所有环节"先验干净，把剩下的变量压到"按键硬件"一项。
+        const char *bs = str_field(root, "btn", "ok");
+        const char *es = str_field(root, "ev", "press");
+        int btn = BSP_BTN_OK;
+        int ev = BSP_BTN_PRESS;
+        if (strcmp(bs, "up") == 0) btn = BSP_BTN_UP;
+        else if (strcmp(bs, "down") == 0) btn = BSP_BTN_DOWN;
+        if (strcmp(es, "release") == 0) ev = BSP_BTN_RELEASE;
+        else if (strcmp(es, "click") == 0) ev = BSP_BTN_CLICK;
+        else if (strcmp(es, "double") == 0) ev = BSP_BTN_DOUBLE;
+        else if (strcmp(es, "long") == 0) ev = BSP_BTN_LONG;
+        terminal_app_key_inject(btn, ev);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.key\",\"btn\":\"%s\",\"ev\":\"%s\"}\n",
+                  id, bs, es);
     } else if (strcmp(c, "vendor.audio_reconnect") == 0) {
         // 厂商扩展：§3.3 禁止"常开无限重试"，所以连败三次后音频通道会自己停手。
         // 这是操作员的手动重试入口——触发一次只重试一轮，不是守护循环。
-        if (!terminal_auth_authorized()) {
-            reply_fmt(reply,
-                      "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.audio_reconnect\",\"err\":\"unauthorized\"}\n",
-                      id);
-        } else {
-            terminal_pav1_start(terminal_net_host(), terminal_auth_audio_port());
-            reply_fmt(reply,
-                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.audio_reconnect\",\"audio_port\":%d}\n",
-                      id, terminal_auth_audio_port());
-        }
+        // 这里刻意不查 auth：网络载体上的命令本来就是认证之后才处理的，
+        // 查 auth 只会挡住 USB——而 USB 意味着物理在场，恰恰是最该允许重试的场景。
+        // 实测教训：堆被上行噎死后会话掉线，auth 没了，操作员连手动重试都被挡在门外。
+        terminal_pav1_start(terminal_net_host(), terminal_auth_audio_port());
+        reply_fmt(reply,
+                  "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.audio_reconnect\",\"audio_port\":%d}\n",
+                  id, terminal_auth_audio_port());
     } else {
         reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"err\":\"unknown_cmd\"}\n", id);
     }

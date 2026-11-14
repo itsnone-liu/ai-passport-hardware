@@ -47,6 +47,16 @@ static void on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user) {
     (void)xQueueSend(s_key_q, &e, 0);
 }
 
+// 厂商扩展入口：把一次按键直接塞进按键队列，与 BSP 回调走同一条路径。
+// 用途：没有人在设备旁边时验证 press/release 语义与 pre-roll 记账。
+// 不绕开 key_task、不直接调 capture，所以它验的是真实分发路径——
+// 唯一没被覆盖的只有按键硬件本身（那一环必须手指来验）。
+void terminal_app_key_inject(int btn, int ev) {
+    if (!s_key_q) return;
+    const key_ev_t e = { .btn = btn, .ev = ev };
+    (void)xQueueSend(s_key_q, &e, 0);
+}
+
 static void key_task(void *arg) {
     (void)arg;
     key_ev_t e;
@@ -56,8 +66,16 @@ static void key_task(void *arg) {
         // 上报给服务器（非阻塞，USB 与网络两个载体都会收到）
         terminal_link_emit_key(e.btn, e.ev);
 
-        // 本地即时反馈：上/下 调音量与亮度，不等服务器回执
-        if (e.ev == BSP_BTN_CLICK || e.ev == BSP_BTN_LONG) {
+        // 说话键按"按住说、松手停"语义处理。
+        // 旧写法是 OK 的 CLICK 才起采、LONG 去调亮度：人手按住说话必然超过 500 ms，
+        // 于是永远走 LONG 分支，只把屏幕调暗，采集一次都没启动过——真人测试失败的真因。
+        // PRESS 起采让 pre-roll 从开口那一刻就填起来；RELEASE 当场收轮，
+        // 不等服务端往返 capture.stop，否则这句话的尾巴会被 300 ms 的 RTT 切掉。
+        if (e.btn == BSP_BTN_OK && e.ev == BSP_BTN_PRESS) {
+            terminal_capture_arm();
+        } else if (e.btn == BSP_BTN_OK && e.ev == BSP_BTN_RELEASE) {
+            terminal_capture_request_end();
+        } else if (e.ev == BSP_BTN_CLICK || e.ev == BSP_BTN_DOUBLE) {
             int vol = terminal_ui_volume();
             int bright = terminal_ui_brightness();
             bool changed = false;
@@ -74,16 +92,13 @@ static void key_task(void *arg) {
                     bsp_lvgl_unlock();
                 }
                 changed = true;
-            } else if (e.btn == BSP_BTN_OK && e.ev == BSP_BTN_LONG) {
+            } else if (e.btn == BSP_BTN_OK && e.ev == BSP_BTN_DOUBLE) {
+                // 亮度挪到双击：长按已经是"说话"了，不能再兼职调亮度。
                 if (bsp_lvgl_lock(200)) {
                     bright = terminal_ui_step_brightness(-20);
                     bsp_lvgl_unlock();
                 }
                 bsp_display_backlight((uint8_t)bright);
-            } else if (e.btn == BSP_BTN_OK && e.ev == BSP_BTN_CLICK) {
-                // 说话键：先在本地起采把 300 ms pre-roll 填起来，
-                // 免得等服务端 capture.start 往返之后才听到"第一声"。
-                terminal_capture_arm();
             }
 
             if (changed) {

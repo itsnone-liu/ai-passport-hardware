@@ -20,6 +20,9 @@ esp_err_t terminal_capture_stop(uint32_t turn_id);
 // 本机按键触发：开始填 pre-roll 并等 capture.start，超时按 cap_start_timeout 放弃。
 void terminal_capture_arm(void);
 
+// 松手：正在送帧就当场收轮（不等服务端 capture.stop），尚未起采就取消本条 pre-roll。
+void terminal_capture_request_end(void);
+
 // true = 有轮次正在进行（armed 或 capturing）。scan 之类需要断开 Wi-Fi 的操作靠它避让。
 bool terminal_capture_busy(void);
 

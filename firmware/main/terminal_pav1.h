@@ -79,6 +79,10 @@ bool terminal_pav1_starting(void);
 // 上行一帧 PCM（turn_id 由调用方给）。返回实际发出的字节数，0 = 通道不可用。
 int terminal_pav1_send_pcm(uint32_t turn_id, const void *pcm, size_t n);
 
+// 非阻塞版本：>0 已送出字节数；0 此刻写不进去（可重试）；-1 通道不可用/错误。
+// 采集任务用这个：写不进去就把帧留在自己那个有界环里，下一拍再试。
+int terminal_pav1_send_pcm_nowait(uint32_t turn_id, const void *pcm, size_t n);
+
 // 上行 END 帧（零载荷），标志该轮上传结束（§5）。
 bool terminal_pav1_send_end(uint32_t turn_id);
 

@@ -16,6 +16,7 @@
 #include "lwip/sockets.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -207,15 +208,62 @@ static bool send_all(const void *buf, size_t n) {
     return true;
 }
 
-static bool send_frame(pav1_kind_t kind, uint32_t turn_id, const void *payload, uint32_t n) {
-    if (s_sock < 0) return false;
+// 有界写：budget_ms=0 时纯非阻塞（立刻返回"此刻写不进去"），>0 时最多等这么久。
+// 返回 1 = 写完全部；0 = 此刻写不进去（可重试）；-1 = 真错误。
+// 存在的理由：原来的 send_all 让采集任务以 250 ms 超时阻塞在写上，
+// 对端不读时 finish_turn 会卡 3.5 秒、期间堆只进不出，整轮机制被一条 socket 拖死。
+//
+// ⚠ 不要把 socket 整体设成 O_NONBLOCK：pav1 的读循环靠阻塞 recv 过日子，
+//   一改非阻塞，recv 立刻返回 EAGAIN，那个"等到 deadline"的循环就变成死自旋，
+//   实测直接把 IDLE 任务饿到 task_wdt 报警。非阻塞只用在这一次 send 上。
+static int send_all_bounded(const void *buf, size_t n, int budget_ms, int flags) {
+    const uint8_t *p = buf;
+    const int64_t deadline = esp_timer_get_time() + (int64_t)budget_ms * 1000;
+    while (n > 0) {
+        const int w = send(s_sock, p, n, flags);
+        if (w > 0) {
+            p += w;
+            n -= (size_t)w;
+            continue;
+        }
+        s_last_sock_errno = errno;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (esp_timer_get_time() >= deadline) return 0;
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        return -1;
+    }
+    return 1;
+}
+
+// PCM 上行的暂存区：一帧必须整帧送出才算送出。
+// 如果 send 只写出去一半就 EAGAIN，必须把剩下的写到同一帧里，
+// 否则下次重试会把帧头再发一遍——对端看到的就是坏流。
+// 只按一帧 PCM 开（640 B）：静态缓冲吃的是 RAM，4 KB 的按最大负载开的版本
+// 在这里纯属浪费（实测那样多占 3.5 KB 堆，等于把 4 个帧的余量白白丢掉）。
+#define NB_STAGE_PCM_MAX 640
+static uint8_t s_nb_stage[PAV1_HDR_LEN + NB_STAGE_PCM_MAX];
+static size_t s_nb_len;
+static size_t s_nb_off;
+
+static int send_frame_budget(pav1_kind_t kind, uint32_t turn_id, const void *payload,
+                             uint32_t n, int budget_ms) {
+    if (s_sock < 0) return -1;
     uint8_t hdr[PAV1_HDR_LEN];
     pav1_encode(hdr, kind, turn_id, NULL, n);  // 只借它填头
-    bool ok = false;
+    int r = -1;
     if (s_tx_mu) xSemaphoreTake(s_tx_mu, portMAX_DELAY);
-    if (s_sock >= 0 && send_all(hdr, sizeof hdr) && (n == 0 || send_all(payload, n))) ok = true;
+    if (s_sock >= 0) {
+        r = send_all_bounded(hdr, sizeof hdr, budget_ms, 0);
+        if (r == 1 && n > 0) r = send_all_bounded(payload, n, budget_ms, 0);
+    }
     if (s_tx_mu) xSemaphoreGive(s_tx_mu);
-    return ok;
+    return s_sock < 0 ? -1 : r;
+}
+
+static bool send_frame(pav1_kind_t kind, uint32_t turn_id, const void *payload, uint32_t n) {
+    return send_frame_budget(kind, turn_id, payload, n, 50) == 1;
 }
 
 static void rx_hook(void *ctx, pav1_kind_t kind, uint32_t turn_id, const uint8_t *payload,
@@ -255,6 +303,10 @@ static bool read_frame(rx_frame_t *f, int timeout_ms, pav1_err_t *err) {
         }
         if (n == 0) return false;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+        // 非阻塞 socket：此刻没数据不是错误，但必须让出 CPU。
+        // 少了这一句，这个"等到 deadline"的循环就变成死自旋，
+        // IDLE 任务饿死 → task_wdt 报警（实测发生过）。
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
     return false;
 }
@@ -284,7 +336,7 @@ static int dial(const char *host, int port) {
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // 音频要小延迟，不要 Nagle
     // lwip 默认发送缓冲只有几 KB，32 KB/s 的上行一旦 RTT 稍大就会被自己的缓冲卡住。
-    int sndbuf = 16384;
+    int sndbuf = 4096;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
     // 下行同理：205 ms RTT 下 5760 B 窗口只够 28 KB/s，低于实时所需的 31.2 KB/s。
     // 窗口是这一端"允许对端在途多少字节"，太小就是在自己身上设了个带宽上限。
@@ -296,6 +348,13 @@ static int dial(const char *host, int port) {
         return -1;
     }
     freeaddrinfo(res);
+    // 音频 socket 设成非阻塞。⚠ 只做这一步会出事：pav1 的读循环原本靠阻塞 recv
+    // 过日子，一改非阻塞 recv 立刻返回 EAGAIN，那个"等到 deadline"的循环就变成
+    // 死自旋，实测把 IDLE 饿到 task_wdt 报警。所以 read_frame 里必须对 EAGAIN 退让。
+    // 反过来，只给 send 打 MSG_DONTWAIT 也没用：lwIP 不看这个标记，仍按
+    // SO_SNDTIMEO 阻塞（实测每拍被拖成 250 ms，2 秒只送出 8 帧）。
+    const int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     return fd;
 }
 
@@ -313,6 +372,8 @@ static void close_sock(void) {
         }
         close(s_sock);
         s_sock = -1;
+        // 半帧暂存必须清掉：留着会在下一条通道上接着写上一轮的残帧。
+        s_nb_len = s_nb_off = 0;
     }
     s_abort_close = false;
     if (s_tx_mu) xSemaphoreGive(s_tx_mu);
@@ -523,6 +584,9 @@ static void serve(void) {
             ESP_LOGW(TAG, "音频通道 recv 错误 errno=%d", errno);
             return;
         }
+        // 非阻塞 socket：没有数据时必须让出 CPU，否则 serve 循环变成死自旋，
+        // 把 IDLE 任务饿到 task_wdt 报警（实测发生过一次）。
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
@@ -625,6 +689,50 @@ int terminal_pav1_send_pcm(uint32_t turn_id, const void *pcm, size_t n) {
     s_tx_frames++;
     s_tx_bytes += (uint32_t)n;
     return (int)n;
+}
+
+// 非阻塞版：返回 >0 = 已送出字节数；0 = 此刻写不进去（可重试，不是错误）；
+// -1 = 通道不可用/真错误。采集侧靠这个"0"把帧留在自己的有界环里，
+// 而不是让 send 阻塞几百毫秒、把堆和整轮状态一起拖死。
+int terminal_pav1_send_pcm_nowait(uint32_t turn_id, const void *pcm, size_t n) {
+    if (!s_ready || !pcm || n == 0 || n > NB_STAGE_PCM_MAX) return -1;
+    if (s_tx_mu) xSemaphoreTake(s_tx_mu, portMAX_DELAY);
+    int ret = 0;
+    if (s_sock < 0) {
+        ret = -1;
+        s_nb_len = s_nb_off = 0;
+        goto done;
+    }
+    if (s_nb_len == 0) {  // 起一帧新的
+        pav1_encode(s_nb_stage, PAV1_K_PCM, turn_id, NULL, (uint32_t)n);
+        memcpy(s_nb_stage + PAV1_HDR_LEN, pcm, n);
+        s_nb_len = PAV1_HDR_LEN + n;
+        s_nb_off = 0;
+    }
+    for (;;) {
+        const size_t left = s_nb_len - s_nb_off;
+        if (left == 0) break;
+        const int w = send(s_sock, s_nb_stage + s_nb_off, left, MSG_DONTWAIT);
+        if (w > 0) {
+            s_nb_off += (size_t)w;
+            continue;
+        }
+        s_last_sock_errno = errno;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            ret = 0;  // 留着重试，下次接着写同一帧
+            goto done;
+        }
+        s_nb_len = s_nb_off = 0;
+        ret = -1;
+        goto done;
+    }
+    s_nb_len = s_nb_off = 0;
+    s_tx_frames++;
+    s_tx_bytes += (uint32_t)n;
+    ret = (int)n;
+done:
+    if (s_tx_mu) xSemaphoreGive(s_tx_mu);
+    return ret;
 }
 
 bool terminal_pav1_send_end(uint32_t turn_id) {
