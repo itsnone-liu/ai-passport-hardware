@@ -219,6 +219,9 @@ auth_act_t terminal_auth_on_reply(const struct cJSON *root, char *out, size_t ca
             return AUTH_ACT_FAILED;
         }
         s_req_id++;
+        // nonce 本来就是明文上线的东西（hello/auth 都在裸 TCP 上），打出来不算泄密；
+        // 而 MAC 本身绝不落日志，否则等于把一次性凭据抄了一份。
+        ESP_LOGI(TAG, "nonce dev=%s srv=%s", s_dev_nonce, s_srv_nonce);
         snprintf(out, cap, "{\"id\":%d,\"cmd\":\"auth\",\"mac\":\"%s\"}\n", s_req_id, mac);
         s_state = ST_WAIT_AUTH;
         ESP_LOGI(TAG, "hello 完成，session=%s audio_port=%d", s_session_id, s_audio_port);
