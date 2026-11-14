@@ -439,3 +439,55 @@ class TestServerKeepalive(unittest.IsolatedAsyncioTestCase):
         server_writer.close()
         srv.close()
         await srv.wait_closed()
+
+
+class TestHelloFallback(unittest.IsolatedAsyncioTestCase):
+    """W2-2: a device that speaks hello must never be left guessing.
+
+    The first version answered an unprovisioned hello with `unknown_device` and
+    then *kept the socket open and silent*, so firmware that only reads valid
+    replies saw "no answer" and burned its own 5 s timeout, twice a minute.
+    """
+
+    async def _hello(self, port, device_id, rid=7):
+        import hashlib
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        nonce = hashlib.sha256(device_id.encode()).hexdigest()[:32]
+        writer.write((json.dumps({"id": rid, "cmd": "hello", "proto": "v1",
+                                  "device_id": device_id, "nonce": nonce}) + "\n").encode())
+        await writer.drain()
+        reply = json.loads(await asyncio.wait_for(reader.readline(), 3))
+        return reader, writer, reply
+
+    async def test_unprovisioned_device_gets_anonymous_session_not_refusal(self):
+        svc = await make_service(allow_anonymous=True)
+        reader, writer, reply = await self._hello(svc.control_port, "psp-f53038")
+        self.assertTrue(reply["ok"], reply)
+        self.assertEqual(7, reply["id"], "reply id must echo the request")
+        self.assertEqual("none", reply["auth"], "no secret configured -> no HMAC")
+        self.assertIn("session_id", reply)
+        await asyncio.sleep(0.05)
+        self.assertIn("psp-f53038", svc.sessions,
+                      "operator must be able to address it by its real id")
+        writer.close()
+        await svc.stop()
+
+    async def test_unprovisioned_device_refused_and_socket_closed_without_anonymous(self):
+        svc = await make_service()                     # allow_anonymous defaults False
+        reader, writer, reply = await self._hello(svc.control_port, "psp-f53038")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(7, reply["id"], "a refusal must still be correlatable")
+        self.assertEqual("unknown_device", reply["err"])
+        tail = await asyncio.wait_for(reader.read(10), 2)
+        self.assertEqual(b"", tail, "silence after a refusal is a bug, not a retry cue")
+        writer.close()
+        await svc.stop()
+
+    async def test_provisioned_device_still_requires_hmac(self):
+        svc = await make_service()                     # DEVICE has a secret
+        reader, writer, reply = await self._hello(svc.control_port, DEVICE)
+        self.assertTrue(reply["ok"])
+        self.assertEqual("hmac", reply["auth"])
+        self.assertIn("server_nonce", reply)
+        writer.close()
+        await svc.stop()

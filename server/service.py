@@ -251,6 +251,7 @@ class Session:
         self.server_nonce_control = ""
         self.server_nonce_audio = ""
         self.authed = False
+        self.auth_mode = "hmac"
         self.state = STATE_IDLE
         self.turn_seq = 0
         self.active_turn: Optional[int] = None
@@ -769,6 +770,7 @@ class Service:
                     "device_id": s.device_id, "session_id": s.session_id,
                     "state": s.state, "turn_id": s.active_turn, "authed": s.authed,
                     "audio": bool(s.audio and s.audio.authed),
+                    "auth": s.auth_mode,
                     "control_open": bool(s.control and not s.control.closed),
                     "turns_done": len(s.metrics),
                 } for s in self.sessions.values()]}
@@ -825,24 +827,42 @@ class Service:
                 await writer.drain()
                 return
             device_id = str(msg.get("device_id", ""))
-            if device_id not in self.cfg.devices:
-                writer.write(b'{"id":0,"ok":false,"err":"unknown_device"}\n')
+            rid = msg.get("id", 0)
+            provisioned = device_id in self.cfg.devices
+            if not provisioned and not self.cfg.allow_anonymous:
+                # Reply with the caller's id and close: a half-open socket that
+                # says nothing is worse than a refusal, because the device has
+                # to wait out its own handshake timeout to learn the same thing.
+                writer.write((json.dumps({"id": rid, "ok": False,
+                                          "err": "unknown_device"}) + "\n").encode())
                 await writer.drain()
+                writer.close()
                 return
+
             session = Session(self, device_id, secrets.token_hex(8))
             link = ControlLink(session, reader, writer)
             session.control = link
+            if not provisioned:
+                # Dev compatibility (protocol §11): an unprovisioned device still
+                # needs a working link, and it needs it under its real device id
+                # so an operator can address it. It gets no HMAC: auth == "none".
+                log.warning("hello from unprovisioned %s: anonymous session (dev mode)",
+                            device_id)
+                session.auth_mode = "none"
+                session.authed = True
+                link.authed = True
             self.sessions[device_id] = session
             self.by_session_id[session.session_id] = session
             server_nonce = self.new_nonce()
             self.note_control_nonce(device_id, str(msg.get("nonce", "")), server_nonce)
             session.device_nonce = str(msg.get("nonce", ""))
             session.server_nonce_control = server_nonce
-            await link.send({"id": msg.get("id", 0), "ok": True, "cmd": "hello",
+            await link.send({"id": rid, "ok": True, "cmd": "hello",
                              "proto": "v1", "server_nonce": server_nonce,
                              "session_id": session.session_id,
                              "audio_port": self.audio_port,
-                             "audio_enabled": self.audio_enabled})
+                             "audio_enabled": self.audio_enabled,
+                             "auth": "hmac" if provisioned else "none"})
             await link.read_loop()
         except asyncio.TimeoutError:
             with contextlib.suppress(Exception):
