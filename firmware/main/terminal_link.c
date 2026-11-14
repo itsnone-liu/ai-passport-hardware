@@ -7,6 +7,9 @@
 #include "cJSON.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "terminal_net.h"
 #include "terminal_ui.h"
 
@@ -17,11 +20,15 @@
 static const char *TAG = "link";
 
 #define LINK_MAX_SINKS 2
-#define LINE_MAX 512
+#define LINE_MAX 512          // 单条入站命令的上限
+#define TX_MAX 2048           // 出站单条消息上限：scan/get_net 的 JSON 比 512 长得多，
+                              // 用 512 的缓冲会 vsnprintf 截断成非法 JSON
 
 static link_sink_t s_sinks[LINK_MAX_SINKS];
 static int s_sink_count;
 static int64_t s_boot_us;
+static char s_tx[TX_MAX];              // 出站组包缓冲（静态，见 terminal_link_init）
+static SemaphoreHandle_t s_tx_mu;
 
 static const char *btn_name(int i) {
     switch (i) {
@@ -43,7 +50,13 @@ static const char *ev_name(int i) {
     }
 }
 
-void terminal_link_init(void) { s_boot_us = esp_timer_get_time(); }
+void terminal_link_init(void) {
+    s_boot_us = esp_timer_get_time();
+    // 发送缓冲放在静态区：2048 字节的栈帧会把 dsh_usb 任务的 4 KB 栈直接打爆，
+    // 现场表现是"一发命令设备就重启"（Stack protection fault）。多任务共用同一个
+    // 缓冲，所以配一把锁。
+    if (!s_tx_mu) s_tx_mu = xSemaphoreCreateMutex();
+}
 
 void terminal_link_register(link_sink_t sink) {
     if (!sink) return;
@@ -61,12 +74,13 @@ void terminal_link_send(const char *line) {
 }
 
 static void send_fmt(const char *fmt, ...) {
-    char buf[LINE_MAX];
+    if (s_tx_mu) xSemaphoreTake(s_tx_mu, portMAX_DELAY);
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
+    vsnprintf(s_tx, sizeof s_tx, fmt, ap);
     va_end(ap);
-    terminal_link_send(buf);
+    terminal_link_send(s_tx);
+    if (s_tx_mu) xSemaphoreGive(s_tx_mu);
 }
 
 static void reply_status(int id) {
@@ -168,7 +182,8 @@ void terminal_link_dispatch(char *line) {
             send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"set_net\",\"err\":\"apply failed\"}\n", id);
         }
     } else if (strcmp(c, "get_net") == 0) {
-        char body[256];
+        // ssid/host 转义后最长约 6 倍，256 装不下一个含中文或引号的 SSID
+        char body[768];
         terminal_net_describe(body, sizeof body);
         send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"net\",%s}\n", id, body);
     } else if (strcmp(c, "scan") == 0) {

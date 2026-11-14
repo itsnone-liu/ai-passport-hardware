@@ -29,6 +29,7 @@ static const char *TAG = "net";
 #define LINE_MAX 512
 #define RETRY_MS 3000
 #define CONNECT_TIMEOUT_S 5
+#define MAX_SCAN_APS 12   // 12 个够现场判断"2.4G 有没有这个 SSID"了
 #define NVS_NS "dshtc"
 
 static int s_sock = -1;
@@ -361,10 +362,55 @@ esp_err_t terminal_net_apply(const char *ssid, const char *password, const char 
     return ESP_OK;
 }
 
+// 每次续写都夹住 used，避免 snprintf 返回"本想写多长"导致 used > n、
+// 进而让 n - used 这个 size_t 减法下溢成天文数字。
+static size_t str_append(char *dst, size_t n, size_t used, const char *s) {
+    if (used >= n) return n - 1;
+    const int w = snprintf(dst + used, n - used, "%s", s);
+    if (w < 0) return used;
+    const size_t next = used + (size_t)w;
+    return next >= n ? n - 1 : next;
+}
+
+// 把原始字节转义成 JSON 字符串内容（不含两侧引号）。SSID 允许包含引号、反斜杠和任意
+// 8-bit 字节，直接 %s 拼进去会生成非法 JSON，主机侧整条消息都解析失败。
+static size_t json_escape(char *dst, size_t dstn, const char *src) {
+    if (!dst || dstn == 0) return 0;
+    size_t w = 0;
+    for (const unsigned char *p = (const unsigned char *)src; p && *p; p++) {
+        const char *esc = NULL;
+        char uni[8];
+        if (*p == '"') esc = "\\\"";
+        else if (*p == '\\') esc = "\\\\";
+        else if (*p == '\n') esc = "\\n";
+        else if (*p == '\r') esc = "\\r";
+        else if (*p == '\t') esc = "\\t";
+        else if (*p < 0x20) {
+            snprintf(uni, sizeof uni, "\\u%04x", *p);
+            esc = uni;
+        }
+        if (esc) {
+            const size_t len = strlen(esc);
+            if (w + len >= dstn) break;
+            memcpy(dst + w, esc, len);
+            w += len;
+        } else {
+            if (w + 1 >= dstn) break;
+            dst[w++] = (char)*p;
+        }
+    }
+    dst[w] = '\0';
+    return w;
+}
+
 void terminal_net_describe(char *buf, size_t n) {
     if (!buf || n == 0) return;
-    snprintf(buf, n, "\"ssid\":\"%s\",\"host\":\"%s\",\"port\":%d,\"password_set\":%s", s_ssid,
-             s_host, s_port, (s_password[0] != '\0') ? "true" : "false");
+    char ssid[6 * 33];
+    char host[6 * 65];
+    json_escape(ssid, sizeof ssid, s_ssid);
+    json_escape(host, sizeof host, s_host);
+    snprintf(buf, n, "\"ssid\":\"%s\",\"host\":\"%s\",\"port\":%d,\"password_set\":%s", ssid, host,
+             s_port, (s_password[0] != '\0') ? "true" : "false");
 }
 
 // 扫描周边 AP，用于现场诊断"为什么连不上"：芯片只支持 2.4 GHz，5 GHz-only 的 SSID
@@ -382,37 +428,58 @@ esp_err_t terminal_net_scan(char *buf, size_t n) {
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(200));
 
-    esp_err_t err = esp_wifi_scan_start(&sc, true);  // 阻塞至扫描完成
-    if (err != ESP_OK) {
-        s_scanning = false;
-        esp_wifi_connect();
-        return err;
-    }
-
+    esp_err_t err = ESP_OK;
     uint16_t found = 0;
-    esp_wifi_scan_get_ap_num(&found);
-    if (found > 12) found = 12;
+    wifi_ap_record_t *recs = NULL;
 
-    size_t used = 0;
-    used += (size_t)snprintf(buf + used, n - used, "\"count\":%u,\"aps\":[", (unsigned)found);
+    // 单一出口：任何一条失败路径都必须把 s_scanning 清掉并重新发起连接，
+    // 否则自动重连的抑制永久生效，设备扫描一次就静默掉线，再也连不回来。
+    err = esp_wifi_scan_start(&sc, true);  // 阻塞至扫描完成
+    if (err != ESP_OK) goto done;
+
+    esp_wifi_scan_get_ap_num(&found);
+    if (found > MAX_SCAN_APS) found = MAX_SCAN_APS;
 
     if (found > 0) {
-        wifi_ap_record_t *recs = calloc(found, sizeof *recs);
-        if (!recs) return ESP_ERR_NO_MEM;
-        uint16_t got = found;
-        if (esp_wifi_scan_get_ap_records(&got, recs) == ESP_OK) {
-            for (uint16_t i = 0; i < got && used + 64 < n; i++) {
-                used += (size_t)snprintf(buf + used, n - used, "%s{\"ssid\":\"%s\",\"rssi\":%d}",
-                                         (i == 0) ? "" : ",", (const char *)recs[i].ssid,
-                                         recs[i].rssi);
-            }
+        recs = calloc(found, sizeof *recs);
+        if (!recs) {
+            err = ESP_ERR_NO_MEM;
+            goto done;
         }
-        free(recs);
+        uint16_t got = found;
+        const esp_err_t rc = esp_wifi_scan_get_ap_records(&got, recs);
+        if (rc != ESP_OK) {
+            err = rc;
+            goto done;
+        }
+        found = got;
     }
-    snprintf(buf + used, n - used, "]");
+
+    // 数组在前、计数在后：count 永远是"真正写出去的数量"，不会出现 count=12 而
+    // 数组只有 3 项这种自相矛盾的输出（缓冲不够时会截断，但截断的仍是合法 JSON）。
+    size_t used = str_append(buf, n, 0, "\"aps\":[");
+    unsigned emitted = 0;
+    for (uint16_t i = 0; i < found; i++) {
+        char esc[6 * 33];
+        char entry[6 * 33 + 40];
+        json_escape(esc, sizeof esc, (const char *)recs[i].ssid);
+        const int need = snprintf(entry, sizeof entry, "%s{\"ssid\":\"%s\",\"rssi\":%d}",
+                                 (emitted == 0) ? "" : ",", esc, recs[i].rssi);
+        if (need < 0) continue;
+        if (used + (size_t)need + 32 >= n) break;  // 留出 "],"count":NNN 的收尾空间
+        used = str_append(buf, n, used, entry);
+        emitted++;
+    }
+    used = str_append(buf, n, used, "],\"count\":");
+    char num[8];
+    snprintf(num, sizeof num, "%u", emitted);
+    str_append(buf, n, used, num);
+
+done:
+    free(recs);
     s_scanning = false;
     esp_wifi_connect();
-    return ESP_OK;
+    return err;
 }
 
 bool terminal_net_ready(void) { return s_connected; }
