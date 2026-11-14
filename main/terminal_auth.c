@@ -108,6 +108,13 @@ static void build_canonical(char *out, size_t cap, const char *role) {
     snprintf(out, cap, "PAV1AUTH|%s|%s|%s|%s", role, s_dev_id, s_dev_nonce, s_srv_nonce);
 }
 
+bool terminal_auth_raw_hmac(const void *data, size_t n, uint8_t out[32]) {
+    if (s_secret_len == 0 || !data) return false;
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info) return false;
+    return mbedtls_md_hmac(info, s_secret, s_secret_len, (const uint8_t *)data, n, out) == 0;
+}
+
 int terminal_auth_provision(const char *secret, const char *device_id_override,
                             const char **enc) {
     if (!secret) return -1;

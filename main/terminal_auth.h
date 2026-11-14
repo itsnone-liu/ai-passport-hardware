@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 struct cJSON;
 
@@ -32,6 +33,11 @@ void terminal_auth_random_hex(char *out, size_t bytes);
 // 音频通道的 audio_mac = HMAC-SHA256(secret, "PAV1AUTH|audio|<device_id>|<dev>|<srv>")。
 // 密钥不离开本文件；调用方只拿到十六进制摘要。
 bool terminal_auth_audio_mac(const char *device_nonce, const char *server_nonce, char out[65]);
+
+// UDP 逐包 MAC：对任意字节算 HMAC-SHA256，调用方取前 N 字节截断用。
+// UDP 没有握手，而设备号是公开的（`psp-xxxxxx` 会出现在日志和仓库里），
+// 所以"这一包确实出自知道密钥的人"只能靠这个摘要来证明。
+bool terminal_auth_raw_hmac(const void *data, size_t n, uint8_t out[32]);
 
 // 开始一次会话握手：生成 device_nonce 并把 hello 行写进 out。
 bool terminal_auth_begin(char *out, size_t cap);

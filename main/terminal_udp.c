@@ -35,6 +35,8 @@ static const char *TAG = "udp";
 #define KEEPALIVE_MS 2000
 #define ACK_TIMEOUT_MS 500
 #define SLOW_RETRY_MS 3000   // 打洞久无回音后的重试间隔（不放弃）
+#define MAC_HELLO 8          // HELLO/ack 的截断 MAC 长度：伪造一次要 2^64
+#define MAC_AUDIO 4          // 音频块：4 字节 = 188 B 包里多 2%，伪造一块要 2^32
 
 static int s_sock = -1;
 static struct sockaddr_in s_peer;
@@ -42,7 +44,7 @@ static volatile bool s_should_run;
 static volatile bool s_ready;      // 服务端 ack 过
 static volatile bool s_slow;        // ack 久等不到：降频重试，但不放弃
 static uint32_t s_sent, s_fail, s_acks, s_hello;
-static uint32_t s_down, s_bad;      // 下行收到的音频块 / 坏包
+static uint32_t s_down, s_bad, s_badmac;  // 下行收到的音频块 / 坏包
 static volatile int s_last_errno;
 static int64_t s_ack_ms;           // 首次 ack 的时刻（用于报告打洞耗时）
 static TaskHandle_t s_task;
@@ -81,15 +83,38 @@ static int raw_send(const uint8_t *buf, size_t n) {
     return w;
 }
 
+// 逐包 MAC。UDP 没有握手，而设备号是公开的（日志、仓库里都有），所以"这包确实
+// 出自知道密钥的人"只能靠摘要来证明。签名范围 = 16 字节头 + 应用载荷，头里含
+// kind/turn/payload_len，因此改头也会验签失败。截断是有意的：188 B 的包再加
+// 32 字节 MAC 就是 17% 开销，而攻击者只需要一次成功就能灌一个 20 ms 块。
+static bool sign_and_send(uint8_t *buf, size_t n, size_t maclen) {
+    uint8_t mac[32];
+    if (!terminal_auth_raw_hmac(buf, n, mac)) return false;   // 没 provision 就不发
+    memcpy(buf + n, mac, maclen);
+    return raw_send(buf, n + maclen) > 0;
+}
+
+static bool verify_mac(const uint8_t *buf, size_t n, size_t maclen) {
+    uint8_t mac[32];
+    if (!terminal_auth_raw_hmac(buf, n, mac)) return false;
+    // 定长比较，不看第一个字节就返回——MAC 比较不能有早退
+    uint8_t diff = 0;
+    for (size_t i = 0; i < maclen; i++) diff |= (uint8_t)(mac[i] ^ buf[n + i]);
+    return diff == 0;
+}
+
 // kind=2：HELLO / ack。payload 里带设备 id，服务端据此把源地址绑到设备。
 static void send_hello(void) {
-    uint8_t buf[UDP_HDR_LEN + 64];
+    uint8_t buf[UDP_HDR_LEN + 64 + MAC_HELLO];
     const char *id = terminal_auth_device_id();
     const size_t idlen = id ? strlen(id) : 0;
     put_hdr(buf, PAV1_K_HELLO, 0, (uint32_t)idlen);
     if (idlen) memcpy(buf + UDP_HDR_LEN, id, idlen);
-    const int w = raw_send(buf, UDP_HDR_LEN + idlen);
-    if (w > 0) s_hello++;
+    if (!sign_and_send(buf, UDP_HDR_LEN + idlen, MAC_HELLO)) {
+        s_fail++;
+        return;
+    }
+    s_hello++;
 }
 
 // 下行重排窗：4 块 = 80 ms。上行实测 142 块里有 1 块乱序，按到达顺序播会把
@@ -181,6 +206,15 @@ static void poll_rx(void) {
         const int r = recv(s_sock, buf, sizeof buf, MSG_DONTWAIT);
         if (r < UDP_HDR_LEN) return;
         if (memcmp(buf, "PAV1", 4) != 0) continue;
+        const uint32_t dlen = rd32(buf + 12);
+        const size_t maclen = (buf[4] == PAV1_K_HELLO) ? MAC_HELLO : MAC_AUDIO;
+        // 长度必须精确：头里写的载荷长度 + MAC 就是整个数据报，多一个字节都不认。
+        if ((size_t)r != UDP_HDR_LEN + (size_t)dlen + maclen) continue;
+        // 先验签再解释内容。被扔掉的水包/伪造包一个 bit 都不会进播放环。
+        if (!verify_mac(buf, UDP_HDR_LEN + dlen, maclen)) {
+            s_badmac++;
+            continue;
+        }
         if (buf[4] == PAV1_K_HELLO) {
             s_acks++;
             if (!s_ready) {
@@ -194,18 +228,13 @@ static void poll_rx(void) {
         }
         if (buf[4] != PAV1_K_ADPCM) continue;
         // 载荷 = [u32 seq][164 B 块]；块自带预测器和步长，丢一块只损失 20 ms。
-        const uint32_t len = (uint32_t)buf[12] | ((uint32_t)buf[13] << 8) |
-                             ((uint32_t)buf[14] << 16) | ((uint32_t)buf[15] << 24);
-        if (len != UDP_MAX_PAYLOAD || r < UDP_HDR_LEN + (int)len) {
+        if (dlen != UDP_MAX_PAYLOAD) {
             s_bad++;
             continue;
         }
-        const uint32_t turn = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8) |
-                              ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
+        const uint32_t turn = rd32(buf + 8);
         const uint8_t *p = buf + UDP_HDR_LEN;
-        const uint32_t seq = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-                             ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-        win_push(turn, seq, p + 4);
+        win_push(turn, rd32(p), p + 4);
     }
 }
 
@@ -292,22 +321,22 @@ bool terminal_udp_send_adpcm(uint32_t turn, uint32_t seq, const uint8_t *blk, si
     put_hdr(buf, PAV1_K_ADPCM, turn, (uint32_t)(n + 4));
     wr32(buf + UDP_HDR_LEN, seq);
     memcpy(buf + UDP_HDR_LEN + 4, blk, n);
-    const int w = raw_send(buf, UDP_HDR_LEN + 4 + n);
-    if (w > 0) {
-        s_sent++;
-        return true;
+    if (!sign_and_send(buf, UDP_HDR_LEN + 4 + n, MAC_AUDIO)) {
+        s_fail++;
+        return false;
     }
-    s_fail++;
-    return false;
+    s_sent++;
+    return true;
 }
 
-void terminal_udp_diag(char *buf, size_t n) {
-    snprintf(buf, n,
+int terminal_udp_diag(char *buf, size_t n) {
+    return snprintf(buf, n,
              "\"udp_ready\":%s,\"udp_sent\":%u,\"udp_fail\":%u,\"udp_ack\":%u,"
-             "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_late\":%u,"
+             "\"udp_hello\":%u,\"udp_down\":%u,\"udp_bad\":%u,\"udp_badmac\":%u,\"udp_late\":%u,"
              "\"udp_reorder\":%u,\"udp_gap\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
              terminal_udp_ready() ? "true" : "false", (unsigned)s_sent, (unsigned)s_fail,
              (unsigned)s_acks, (unsigned)s_hello, (unsigned)s_down, (unsigned)s_bad,
+             (unsigned)s_badmac,
              (unsigned)s_late, (unsigned)s_reorder, (unsigned)s_gap, s_slow ? "true" : "false",
              s_last_errno, (long long)s_ack_ms);
 }

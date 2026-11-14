@@ -447,8 +447,8 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
                       id);
         }
     } else if (strcmp(c, "get_audio") == 0) {
-        char audio[448];
-        char play[320];
+        char audio[768];
+        char play[448];
         terminal_capture_get_audio(audio, sizeof audio);
         terminal_playback_describe(play, sizeof play);
         reply_fmt(reply,

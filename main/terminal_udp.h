@@ -27,4 +27,4 @@ bool terminal_udp_ready(void);
 bool terminal_udp_send_adpcm(uint32_t turn, uint32_t seq, const uint8_t *blk, size_t n);
 
 // JSON 片段，给 get_audio / vendor.udp_diag 看：ready/sent/fail/ack/peer。
-void terminal_udp_diag(char *buf, size_t n);
+int terminal_udp_diag(char *buf, size_t n);

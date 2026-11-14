@@ -567,10 +567,18 @@ void terminal_capture_get_audio(char *buf, size_t n) {
              (int)s_pre_peak, s_pend_count, pend_age_ms(), s_pend_count * 20, (unsigned)s_seq);
     // UDP 通道自证：ready 之前采集一定还在走 TCP，所以这两个字段能直接
     // 说明"这一轮的音频到底走的是哪条路"。
+    // 截断在这里是致命的：JSON 一断，上位机把整条 get_audio 都解析不出来，
+    // 表现成"设备没应答"，比丢一个字段难查得多（加 udp_badmac 时就踩过）。
     const size_t used = strlen(buf);
     if (used + 2 < n) {
         buf[used] = ',';
-        terminal_udp_diag(buf + used + 1, n - used - 1);
+        const int w = terminal_udp_diag(buf + used + 1, n - used - 1);
+        if (w < 0 || (size_t)w >= n - used - 1) {
+            ESP_LOGW(TAG, "get_audio 被截断：缓冲 %u 字节不够（需要约 %u），调大 terminal_link.c",
+                     (unsigned)n, (unsigned)(used + 1 + (w > 0 ? (size_t)w : 0)));
+        }
+    } else {
+        ESP_LOGW(TAG, "get_audio 没空间放 udp 诊断：%u/%u 已用", (unsigned)used, (unsigned)n);
     }
 }
 
