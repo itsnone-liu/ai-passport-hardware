@@ -747,6 +747,11 @@ class Session:
         self.metrics.append(m)
         pcm = bytes(self._capture_buf)
         self._capture_buf = bytearray()
+        if len(pcm) < 3200:                     # < 0.1 s: not speech, not worth a call
+            log.info("%s turn %d has only %d bytes; skipping ASR", self.device_id,
+                     turn_id, len(pcm))
+            await self._to_idle(turn_id)
+            return
         try:
             transcript = await self.service.asr.transcribe(pcm)
             m.asr_ms = self.service.now_ms()
