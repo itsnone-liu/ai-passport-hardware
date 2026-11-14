@@ -340,6 +340,13 @@ class Session:
         # 收轮时要不要等尾巴，别给 TCP 轮次平白加 120 ms。
         self._udp = audio_udp.Reorder()
         self._udp_used = False
+        # downlink: after hole punching the server knows the device's UDP addr,
+        # so playback goes there; before that it stays on this TCP unchanged.
+        self.udp_peer = None
+        self.udp_transport = None
+        self._down_seq = 0
+        self._down_state = (0, 0)
+        self.down_udp_frames = 0
         self.udp_blocks = 0
         self._adpcm_seq: Optional[int] = None
         self._adpcm_blocks = 0
@@ -961,6 +968,32 @@ class Session:
                 with contextlib.suppress(asyncio.CancelledError):
                     await producer
 
+    async def send_down_frame(self, turn_id: int, frame: bytes) -> None:
+        """One downlink frame: UDP/ADPCM once punched, otherwise TCP/PCM.
+
+        640 B of PCM straight over UDP is 64 KB/s; this link measured 18.7 KB/s,
+        so it cannot be sent. Downlink is compressed the same way as uplink:
+        320 samples == one 20 ms frame == one 164 B block, 188 B on the wire,
+        8.4 KB/s. Every block carries its own predictor and step index, so a
+        lost block costs 20 ms and needs no retransmission -- that is exactly
+        what makes UDP usable here.
+        """
+        if (self.udp_peer is not None and self.udp_transport is not None
+                and not self.udp_transport.is_closing()):
+            blk, self._down_state = adpcm.encode_block(frame, self._down_state)
+            payload = adpcm.encode_payload(self._down_seq, blk)
+            self._down_seq = (self._down_seq + 1) & 0xFFFFFFFF
+            try:
+                self.udp_transport.sendto(
+                    audio_udp.build(audio_udp.KIND_ADPCM, turn_id, payload), self.udp_peer)
+            except OSError:
+                self.udp_peer = None      # fall back at once: a silent turn is worse
+                await self.send_down_frame(turn_id, frame)
+                return
+            self.down_udp_frames += 1
+            return
+        await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)
+
     async def _write_audio(self, audio: bytes, turn_id: int, m: TurnMetrics) -> None:
         """Push 640 B frames, holding a lead of ~400 ms over real time.
 
@@ -1170,6 +1203,12 @@ class Service:
             dev = payload.decode("ascii", "replace").strip()
             fresh = self._udp_addrs.get(addr) != dev
             self._udp_addrs[addr] = dev
+            sess = self.sessions.get(dev)
+            if sess is not None:
+                if sess.udp_peer != addr:
+                    log.info("%s downlink via udp %s:%d", dev, addr[0], addr[1])
+                sess.udp_peer = addr
+                sess.udp_transport = transport
             self.udp_hello += 1
             transport.sendto(audio_udp.build(audio_udp.KIND_HELLO, 0), addr)
             if fresh:
@@ -1302,6 +1341,36 @@ class Service:
                     "looks_like_undecoded_hex": (len(key) == 64 and all(
                         c in b"0123456789abcdefABCDEF" for c in key)),
                 } for dev, key in self.cfg.devices.items()]}
+            if op == "push_udp":
+                # Bench: drive the real downlink path (playback.start -> ADPCM
+                # datagrams -> playback.stop) so jitter/underrun can be measured
+                # without a human speaking or a TTS reply.
+                session = self.sessions[str(req.get("device", ""))]
+                if session.udp_peer is None:
+                    return {"ok": False, "err": "no_udp_peer"}
+                turn = int(req.get("turn_id", 9))
+                n = int(req.get("frames", 100))
+                hz = float(req.get("hz", 440))
+                if session.control is not None:
+                    await session.control.request("playback.start", self.cfg.request_timeout,
+                                                  turn_id=turn)
+                import math
+                import struct as _struct
+                for i in range(n):
+                    samples = pav1.FRAME_BYTES_20MS // 2
+                    base = i * samples
+                    pcm = b"".join(
+                        _struct.pack("<h", int(6000 * math.sin(
+                            2 * math.pi * hz * (base + k) / 16000)))
+                        for k in range(samples))
+                    await session.send_down_frame(turn, pcm)
+                    await asyncio.sleep(0.02)
+                if session.control is not None:
+                    with contextlib.suppress(Exception):
+                        await session.control.request("playback.stop",
+                                                      self.cfg.request_timeout, turn_id=turn)
+                return {"ok": True, "turn_id": turn, "frames": n,
+                        "udp_frames": session.down_udp_frames}
             if op == "push_frames":
                 # Bench aid: push raw PAV1 frames with no playback.start, so the
                 # device can be measured reading the socket in isolation.
