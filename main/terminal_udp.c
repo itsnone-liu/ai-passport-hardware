@@ -100,6 +100,7 @@ static void poll_ack(void) {
         s_acks++;
         if (!s_ready) {
             s_ready = true;
+            s_slow = false;   // 通了就不再是"慢速重试"模式
             s_ack_ms = esp_timer_get_time() / 1000;
             ESP_LOGI(TAG, "UDP 打洞完成：服务端听得到我们了（%u 次 HELLO 后 ack）",
                      (unsigned)s_hello);
@@ -200,7 +201,7 @@ bool terminal_udp_send_adpcm(uint32_t turn, uint32_t seq, const uint8_t *blk, si
 void terminal_udp_diag(char *buf, size_t n) {
     snprintf(buf, n,
              "\"udp_ready\":%s,\"udp_sent\":%u,\"udp_fail\":%u,\"udp_ack\":%u,"
-             "\"udp_hello\":%u,\"udp_fallback\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
+             "\"udp_hello\":%u,\"udp_slow\":%s,\"udp_errno\":%d,\"udp_ack_ms\":%lld",
              terminal_udp_ready() ? "true" : "false", (unsigned)s_sent, (unsigned)s_fail,
              (unsigned)s_acks, (unsigned)s_hello, s_slow ? "true" : "false",
              s_last_errno, (long long)s_ack_ms);
