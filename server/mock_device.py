@@ -56,6 +56,8 @@ class MockPassport:
 
         self._listening = asyncio.Event()
         self._playback_started = asyncio.Event()
+        self.t_playback_cmd = 0.0
+        self.t_first_pcm = 0.0
         self._playback_ended = asyncio.Event()
         self._end_reason = ""
         self._control_task: Optional[asyncio.Task] = None
@@ -218,6 +220,7 @@ class MockPassport:
             self.state = "speaking"
             self.playback = bytearray()
             self.received_end = False
+            self.t_playback_cmd = time.monotonic()
             await self._reply(msg, turn_id=self.turn_id)
             self._playback_started.set()
         elif cmd == "playback.stop":
@@ -303,6 +306,8 @@ class MockPassport:
             if obj.get("ok") is False:
                 self.errors.append({"event": "error", "code": obj.get("err", "hello_failed")})
         elif frame.kind == pav1.KIND_PCM:
+            if not self.t_first_pcm:
+                self.t_first_pcm = time.monotonic()
             self.playback += frame.payload
             if frame.turn_id not in self.playback_turns:
                 self.playback_turns.append(frame.turn_id)

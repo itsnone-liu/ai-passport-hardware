@@ -277,6 +277,8 @@ class Session:
         self.last_pre_roll_ms = -1
         self.last_capture_frames = -1
         self.last_capture_dropped = -1
+        self.last_rms = -1
+        self.last_peak = -1
         self._last_end_reason = ""
         self._current_prefix = b""
 
@@ -401,9 +403,14 @@ class Session:
                 self.last_capture_frames = int(msg.get("frames", -1))
             if "dropped" in msg:
                 self.last_capture_dropped = int(msg.get("dropped", -1))
-            log.info("%s capture.ended turn=%s reason=%s frames=%s dropped=%s",
+            # rms/peak prove the frames carry sound, not silence: frame counts
+            # stay perfect on a stream of zeros.
+            self.last_rms = int(msg.get("rms", -1))
+            self.last_peak = int(msg.get("peak", -1))
+            log.info("%s capture.ended turn=%s reason=%s frames=%s dropped=%s rms=%s peak=%s",
                      self.device_id, msg.get("turn_id"), self._last_capture_reason,
-                     self.last_capture_frames, self.last_capture_dropped)
+                     self.last_capture_frames, self.last_capture_dropped,
+                     self.last_rms, self.last_peak)
             self._capture_ended.set()
         elif ev == "playback.ended":
             self._last_end_reason = str(msg.get("reason", ""))
@@ -469,6 +476,8 @@ class Session:
                 # framing can be verified now; never play them, never ASR them.
                 self.probe_frames += 1
                 self.probe_bytes += len(payload)
+                self.service.totals["frames"] += 1
+                self.service.totals["bytes"] += len(payload)
                 self.probe_last_turn = turn_id
                 now = time.monotonic()
                 if now - self._probe_log_at >= 1.0:
@@ -490,6 +499,7 @@ class Session:
                 # owned the turn -- still prove the END frame arrived.
                 self.probe_end_frames += 1
                 self.probe_end_turn = turn_id
+                self.service.totals["ends"] += 1
                 log.info("%s uplink probe: END seen for turn %d", self.device_id, turn_id)
             return
         self._capture_ended.set()
@@ -601,25 +611,65 @@ class Session:
             m.done_ms = self.service.now_ms()
 
     async def _speak(self, turn_id: int, m: TurnMetrics) -> None:
+        """Stream a reply: start synthesising first, announce playback second.
+
+        Order matters for the device. Sending playback.start and only then
+        calling TTS hands the device a 1.1 s silence after an announcement that
+        sounds like "audio is coming" -- measured, and it is why a 300 ms
+        prebuffer looked impossible to honour. Synthesising into a queue and
+        announcing when the first chunk already exists makes that delay vanish
+        from the device's point of view (it still has to tolerate a slow TTS, but
+        the stall timer, not the prebuffer, is what covers it).
+        """
         self.state = STATE_SPEAKING
         self._played_end = asyncio.Event()
-        await self.control.request("playback.start", self.cfg.request_timeout,
-                                  turn_id=turn_id)
+        queue: asyncio.Queue = asyncio.Queue()
+        producer_done = object()
 
-        async for chunk in self.service.brain.ask(m.text, session=self.service.dsh_session):
-            if m.dsh_first_ms is None:
-                m.dsh_first_ms = self.service.now_ms()
-            async for audio in self.service.tts.stream(chunk):
-                if self._cancel.is_set():
+        async def produce() -> None:
+            try:
+                async for chunk in self.service.brain.ask(m.text,
+                                                          session=self.service.dsh_session):
+                    if m.dsh_first_ms is None:
+                        m.dsh_first_ms = self.service.now_ms()
+                    async for audio in self.service.tts.stream(chunk):
+                        if self._cancel.is_set():
+                            return
+                        await queue.put(audio)
+            except Exception as exc:                       # noqa: BLE001
+                log.exception("synthesis failed")
+                await queue.put(exc)
+            finally:
+                await queue.put(producer_done)
+
+        producer = asyncio.create_task(produce())
+        try:
+            first = await queue.get()
+            if isinstance(first, Exception):
+                raise first
+            if first is producer_done:
+                return
+            await self.control.request("playback.start", self.cfg.request_timeout,
+                                       turn_id=turn_id)
+            await self._write_audio(first, turn_id, m)
+            while True:
+                item = await queue.get()
+                if item is producer_done or self._cancel.is_set():
                     break
-                await self._write_audio(audio, turn_id, m)
-            if self._cancel.is_set():
-                break
-        await self.audio.send_frame(pav1.KIND_END, turn_id)
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self._played_end.wait(), self.cfg.playback_tail_timeout)
-        m.cancelled = self._last_end_reason == "cancelled"
-        await self._to_idle(turn_id)
+                if isinstance(item, Exception):
+                    raise item
+                await self._write_audio(item, turn_id, m)
+            await self.audio.send_frame(pav1.KIND_END, turn_id)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._played_end.wait(),
+                                       self.cfg.playback_tail_timeout)
+            m.cancelled = self._last_end_reason == "cancelled"
+            await self._to_idle(turn_id)
+        finally:
+            if not producer.done():
+                producer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await producer
 
     async def _write_audio(self, audio: bytes, turn_id: int, m: TurnMetrics) -> None:
         step = pav1.FRAME_BYTES_20MS
@@ -729,6 +779,9 @@ class Service:
         self._servers: list[asyncio.AbstractServer] = []
         self._nonces: Dict[str, str] = {}
         self._seen_nonces: set[str] = set()
+        # Process-lifetime counters: per-session numbers reset on every
+        # reconnect, so acceptance evidence needs a total that does not.
+        self.totals = {"frames": 0, "bytes": 0, "ends": 0, "sessions": 0}
         self._audio_nonces: Dict[str, str] = {}
         self.dsh_session = cfg.dsh_session
 
@@ -888,7 +941,9 @@ class Service:
                         "last_pre_roll_ms": session.last_pre_roll_ms,
                         "last_capture_frames": session.last_capture_frames,
                         "last_capture_dropped": session.last_capture_dropped,
-                        "turns_done": len(session.metrics)}
+                        "last_rms": session.last_rms, "last_peak": session.last_peak,
+                        "turns_done": len(session.metrics),
+                        "totals": dict(self.totals)}
             if op == "show":
                 session = self.sessions[str(req.get("device", ""))]
                 return {"ok": True, "reply": await session.show_text(str(req.get("text", "")))}
