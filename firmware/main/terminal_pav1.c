@@ -22,7 +22,7 @@
 static const char *TAG = "pav1";
 
 #define HANDSHAKE_TIMEOUT_MS 3000
-#define RECV_TIMEOUT_S 2
+#define RECV_TIMEOUT_S 1  // 短一点：空闲时也要能及时响应"该发帧了"这类本地请求
 #define IDLE_DROP_S 180
 #define RX_BUF 1024
 
@@ -184,12 +184,18 @@ static volatile uint32_t s_rx_bad;
 static pav1_err_t s_last_err;
 static volatile bool s_ul_req;
 static uint32_t s_ul_frames, s_ul_tone;
+static volatile int s_last_sock_errno;
 
 static bool send_all(const void *buf, size_t n) {
     const uint8_t *p = buf;
     while (n > 0) {
         const int w = send(s_sock, p, n, 0);
-        if (w <= 0) return false;
+        if (w <= 0) {
+            // 记下 errno：ENOBUFS（pbuf 用光）和 EAGAIN/ETIMEDOUT（窗口关/对端不读）
+            // 是两种完全不同的病因，混在一起就只能靠猜。
+            s_last_sock_errno = errno;
+            return false;
+        }
         p += w;
         n -= (size_t)w;
     }
@@ -268,6 +274,9 @@ static int dial(const char *host, int port) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof rcv);
     const int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);  // 音频要小延迟，不要 Nagle
+    // lwip 默认发送缓冲只有几 KB，32 KB/s 的上行一旦 RTT 稍大就会被自己的缓冲卡住。
+    int sndbuf = 16384;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
         close(fd);
         freeaddrinfo(res);
@@ -410,6 +419,8 @@ static void do_uplink_test(void) {
     const uint32_t tone = s_ul_tone ? s_ul_tone : 1000;
     static int16_t pcm[PAV1_FRAME_BYTES / 2];
     uint32_t sent = 0;
+    s_last_sock_errno = 0;
+    const int64_t t0 = esp_timer_get_time();
     for (uint32_t i = 0; i < frames && s_ready; i++) {
         for (int j = 0; j < (int)(PAV1_FRAME_BYTES / 2); j++) {
             const double t = (double)(i * (PAV1_FRAME_BYTES / 2) + (uint32_t)j) / 16000.0;
@@ -419,14 +430,17 @@ static void do_uplink_test(void) {
         else break;
         vTaskDelay(pdMS_TO_TICKS(20));  // 按 20 ms 节拍推，不突发灌爆对端
     }
-    char ev[192];
+    const int elapsed_ms = (int)((esp_timer_get_time() - t0) / 1000);
+    char ev[256];
     snprintf(ev, sizeof ev,
-             "{\"event\":\"uplink_test\",\"ok\":%s,\"frames\":%u,\"sent\":%u,\"tone_hz\":%u,"
-             "\"frame_bytes\":%u}\n",
+             "{\"event\":\"uplink_test\",\"ok\":%s,\"frames\":%u,\"sent\":%u,\"bytes\":%u,"
+             "\"elapsed_ms\":%d,\"tone_hz\":%u,\"frame_bytes\":%u,\"sock_errno\":%d}\n",
              (sent == frames) ? "true" : "false", (unsigned)frames, (unsigned)sent,
-             (unsigned)tone, (unsigned)PAV1_FRAME_BYTES);
+             (unsigned)(sent * PAV1_FRAME_BYTES), elapsed_ms, (unsigned)tone,
+             (unsigned)PAV1_FRAME_BYTES, s_last_sock_errno);
     terminal_link_send_src(LINK_SRC_TCP, ev);
-    ESP_LOGI(TAG, "上行自测：%u/%u 帧", (unsigned)sent, (unsigned)frames);
+    ESP_LOGI(TAG, "上行自测：%u/%u 帧，%d ms，errno=%d", (unsigned)sent, (unsigned)frames, elapsed_ms,
+             s_last_sock_errno);
 }
 
 static void serve(void) {

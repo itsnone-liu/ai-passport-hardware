@@ -359,6 +359,19 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
                       "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.uplink_test\",\"err\":\"not_supported\"}\n",
                       id);
         }
+    } else if (strcmp(c, "vendor.audio_reconnect") == 0) {
+        // 厂商扩展：§3.3 禁止"常开无限重试"，所以连败三次后音频通道会自己停手。
+        // 这是操作员的手动重试入口——触发一次只重试一轮，不是守护循环。
+        if (!terminal_auth_authorized()) {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.audio_reconnect\",\"err\":\"unauthorized\"}\n",
+                      id);
+        } else {
+            terminal_pav1_start(terminal_net_host(), terminal_auth_audio_port());
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.audio_reconnect\",\"audio_port\":%d}\n",
+                      id, terminal_auth_audio_port());
+        }
     } else {
         reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"err\":\"unknown_cmd\"}\n", id);
     }
