@@ -85,6 +85,10 @@ class Config:
     hello_timeout: float = 5.0
     request_timeout: float = 5.0
     capture_timeout: float = 30.0
+    # After `key release` the device ends the turn itself (firmware d7cfe32).
+    # Older builds wait for capture.stop instead; this is how long we wait for
+    # the device's own capture.ended before assuming it wants the legacy path.
+    capture_release_timeout: float = 1.5
     playback_tail_timeout: float = 10.0
     playback_stall_timeout: float = 2.0
 

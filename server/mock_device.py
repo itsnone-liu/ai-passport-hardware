@@ -68,6 +68,8 @@ class MockPassport:
         self.received_end = False
         self.server_audio_nonce = ""
         self.busy_once = False
+        self.legacy_turn_end = False
+        self.uplink_stall = False
         self.pre_roll_ms = 0
         self.captured_frames = 0
         self.audio_device_nonce = ""
@@ -323,7 +325,17 @@ class MockPassport:
 
     # -- device actions ----------------------------------------------------
     async def press_ok(self) -> None:
-        await self._emit({"event": "key", "btn": "ok", "ev": "click"})
+        await self._emit({"event": "key", "btn": "ok", "ev": "press"})
+
+    async def release_ok(self) -> None:
+        """Release: the device closes the turn itself (no capture.stop expected)."""
+        await self._emit({"event": "key", "btn": "ok", "ev": "release"})
+        if getattr(self, "legacy_turn_end", False):
+            return                      # old firmware waits for capture.stop
+        await self._send_end()
+        await self._emit({"event": "capture.ended", "turn_id": self.turn_id,
+                          "reason": "released", "frames": self.captured_frames,
+                          "dropped": 0, "rms": 666, "peak": 3256})
 
     async def stream_pcm(self, pcm: bytes, pace: float = 0.0) -> None:
         assert self.audio_writer is not None
@@ -348,7 +360,11 @@ class MockPassport:
         await self.press_ok()
         await asyncio.wait_for(self._listening.wait(), timeout)
         await self.stream_pcm(pcm, self.upload_pace)
-        await self.press_ok()                      # release -> server sends capture.stop
+        if self.uplink_stall:
+            await self._emit({"event": "capture.ended", "turn_id": self.turn_id,
+                              "reason": "uplink_stall"})
+        else:
+            await self.release_ok()
         await asyncio.wait_for(self._playback_ended.wait(), timeout)
         return {
             "turn_id": self.turn_id,

@@ -251,12 +251,28 @@ while (len >= 16) {
 | 事件 | 说明 |
 |---|---|
 | `ready` `{link:"usb"\|"net"}` | 每条载体各自一次，**必须在 `auth` 成功之后才发** |
-| `key` `{btn,ev}` | 原样保留；`ev` ∈ press/click/double/long/release |
+| `key` `{btn,ev}` | `ev` ∈ `press`/`release`（v1.1，见下）；设备侧仍可能同时发 `click`/`long`/`double` 供 UI 用，但**采集只认 press/release** |
 | `capture.started` `{turn_id, pre_roll_ms}` | pre-roll 已补发，开始送实时帧；`pre_roll_ms` 是**实测值**（0 或 300），由设备按键与否决定 |
 | `capture.ended` `{turn_id, reason, frames, dropped}` | `reason` ∈ `released`/`cancelled`/`max_duration`/`error`；`frames`/`dropped` 为实测计数 |
 | `playback.started` `{turn_id}` | I2S 已出第一块声音 |
 | `playback.ended` `{turn_id,reason}` | `completed`/`cancelled`/`underrun`/`error` |
 | `error` `{turn_id?,code,detail?}` | 结构化，见 §6.5 |
+
+> **v1.1 变更：轮次的开始与结束都在设备侧**（固件 `d7cfe32`，2026-11-14）
+>
+> 1. **触发词**：`press` 立即起采（服务端发 `capture.start`）。原来的 `click` 是错的——
+>    人按住说话必然超过 500 ms，固件会判成长按去做亮度调节，采集一次都没启动过；
+>    我们据此"识别"到的其实是环境噪声。
+> 2. **结束权在设备**：`release` 后设备自己发 `END` 帧 + `capture.ended`，服务端**不再发
+>    `capture.stop`**（发了会得到 `err:"turn_closed"`，属正常，当成功处理、不重试）。
+> 3. **`capture.ended.reason` 决定怎么收尾**：`released` 正常；`uplink_stall` = 服务端
+>    2 s 内没读走任何一帧（消费端没挂上）；`cap_start_timeout` = 按键后 3 s 没等到
+>    `capture.start`。后两种**不得跑 ASR**——那会把半句话转成文本，看起来像 ASR 的 bug。
+> 4. **起采后设备静默丢弃前 120 ms 旧 DMA 帧**，所以 `capture.started` 之后的第一批 PCM
+>    已经是当前这句；而 `pre_roll_ms`（≈300）是**按下之前**的真人声，已补在流最前面，
+>    **不要裁掉**。
+> 5. 服务端兜底：`release` 后等 `capture_release_timeout`（默认 1.5 s）仍无 `capture.ended`，
+>    才按旧固件补发一次 `capture.stop`。这条只为兼容过渡期的一个版本。
 
 `ready` 的时机是签认时补定的：早期固件连上就发 `ready`，而 §3.2 规定 auth 之前除 `hello`/`auth`
 外一律 `unauthorized`——两者直接冲突，且三次就会关连接。**定案：`ready` 在 `auth` 成功后发**，

@@ -600,6 +600,48 @@ class TestAudioChannelAccept(unittest.IsolatedAsyncioTestCase):
         writer.close()
 
 
+class TestPressReleaseSemantics(ServiceCase):
+    """Firmware d7cfe32: press starts, release ends, the device never wants stop.
+
+    A sentence held on a button is always longer than the 500 ms long-press
+    threshold, so keying capture on `click` meant capture never started and the
+    "speech" we transcribed was room noise.
+    """
+
+    async def test_press_starts_and_release_ends_without_capture_stop(self):
+        result = await self.dev.converse(UPLOAD)
+        self.assertGreater(len(result["audio"]), 0)
+        cmds = [c["cmd"] for c in self.dev.commands]
+        self.assertIn("capture.start", cmds)
+        self.assertNotIn("capture.stop", cmds,
+                         "the device ends the turn itself; asking again gets turn_closed")
+
+    async def test_legacy_firmware_still_gets_capture_stop(self):
+        """One release cycle of compatibility: old builds wait to be told."""
+        self.dev.legacy_turn_end = True
+        self.svc.cfg.capture_release_timeout = 0.3
+        result = await self.dev.converse(UPLOAD, timeout=15)
+        self.assertIn("capture.stop", [c["cmd"] for c in self.dev.commands])
+        self.assertGreater(len(result["audio"]), 0)
+
+    async def test_uplink_stall_aborts_without_running_asr(self):
+        """A deliberate device abort must not be transcribed as half a sentence."""
+        self.dev.uplink_stall = True
+        session = self.svc.session_of(DEVICE)
+        await self.dev.press_ok()
+        await asyncio.wait_for(self.dev._listening.wait(), 5)
+        await self.dev.stream_pcm(UPLOAD)
+        await self.dev._emit({"event": "capture.ended", "turn_id": self.dev.turn_id,
+                              "reason": "uplink_stall"})
+        for _ in range(50):
+            if session.state == STATE_IDLE:
+                break
+            await asyncio.sleep(0.02)
+        self.assertEqual(STATE_IDLE, session.state)
+        codes = [e.get("code") for e in self.dev.events if e.get("event") == "error"]
+        self.assertIn("uplink_stall", codes)
+
+
 class TestCaptureSignals(ServiceCase):
     """Fields the firmware now sends, and the retry it asks the server for."""
 

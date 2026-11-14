@@ -424,7 +424,7 @@ class Session:
             log.info("%s capture.started turn=%s pre_roll_ms=%s", self.device_id,
                      msg.get("turn_id"), self.last_pre_roll_ms)
         elif ev == "capture.ended":
-            self._last_capture_reason = str(msg.get("reason", ""))
+            self._last_capture_reason = str(msg.get("reason", "")) or "released"
             if "frames" in msg:
                 self.last_capture_frames = int(msg.get("frames", -1))
             if "dropped" in msg:
@@ -438,6 +438,9 @@ class Session:
                      self.last_capture_frames, self.last_capture_dropped,
                      self.last_rms, self.last_peak)
             self._capture_ended.set()
+            # The device ends the turn on release; the server no longer asks.
+            if self.state == STATE_LISTENING:
+                asyncio.create_task(self.end_capture(self._last_capture_reason))
         elif ev == "playback.ended":
             self._last_end_reason = str(msg.get("reason", ""))
             self._played_end.set()
@@ -532,16 +535,26 @@ class Session:
 
     # -- key handling ------------------------------------------------------
     async def on_key(self, btn: str, ev: str) -> None:
-        if btn != "ok" or ev != "click":
+        """press starts capture, release ends it.
+
+        The device owns the button semantics since firmware d7cfe32: a human
+        holding a button for a sentence always exceeds the 500 ms long-press
+        threshold, so keying capture off `click` meant it never started at all
+        -- we spent a round investigating 340 ms of room noise as if it were
+        speech because of exactly that.
+        """
+        if btn != "ok":
             return
-        if self.state == STATE_IDLE:
-            await self.begin_capture()
-        elif self.state == STATE_LISTENING:
-            await self.end_capture()
-        elif self.state == STATE_SPEAKING:
-            await self.cancel_playback()
-        else:
-            await self.report_error("busy", f"state={self.state}")
+        if ev == "press":
+            if self.state == STATE_IDLE:
+                await self.begin_capture()
+            elif self.state == STATE_SPEAKING:
+                await self.cancel_playback()
+            else:
+                await self.report_error("busy", f"state={self.state}")
+        elif ev == "release":
+            if self.state == STATE_LISTENING:
+                await self.end_capture("released")
 
     async def begin_capture(self) -> None:
         if not self.audio or not self.audio.authed:
@@ -591,16 +604,44 @@ class Session:
                 await self.end_capture(reason="max_duration")
 
     async def end_capture(self, reason: str = "released") -> None:
+        """Close the turn. The device already sent its END + capture.ended.
+
+        Order matters: waiting for capture.ended first keeps the two firmwares
+        compatible for one release cycle. New firmware ends the turn on release
+        and never wants `capture.stop` (it answers `turn_closed`); old firmware
+        only stops when asked. Waiting a short beat costs nothing and avoids
+        pinning the project to one build.
+        """
         if self.state != STATE_LISTENING:
             return
         if self._capture_task:
             self._capture_task.cancel()
             self._capture_task = None
         turn = self.active_turn
-        await self.control.request("capture.stop", self.cfg.request_timeout, turn_id=turn)
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self._capture_ended.wait(), 2.0)
         self.state = STATE_PROCESSING
+
+        if not self._capture_ended.is_set():
+            try:
+                await asyncio.wait_for(self._capture_ended.wait(),
+                                       self.cfg.capture_release_timeout)
+            except asyncio.TimeoutError:
+                log.warning("%s no capture.ended after %.1fs; falling back to "
+                            "capture.stop (legacy firmware)", self.device_id,
+                            self.cfg.capture_release_timeout)
+                with contextlib.suppress(Exception):
+                    await self.control.request("capture.stop", self.cfg.request_timeout,
+                                               turn_id=turn)
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(self._capture_ended.wait(), 2.0)
+
+        reason = self._last_capture_reason or reason
+        if reason in ("uplink_stall", "cap_start_timeout"):
+            # The device aborted deliberately; running ASR on a truncated buffer
+            # would transcribe half a sentence and look like an ASR bug.
+            await self.report_error(reason, f"turn {turn}")
+            await self._to_idle(turn)
+            return
+
         await self.control.send({"event": "state", "state": STATE_PROCESSING,
                                  "turn_id": turn})
         await self.control.request("state.set", self.cfg.request_timeout,
