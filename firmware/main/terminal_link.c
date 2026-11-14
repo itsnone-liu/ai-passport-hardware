@@ -187,6 +187,12 @@ static int int_field(const cJSON *root, const char *name, int dflt) {
     return cJSON_IsNumber(it) ? it->valueint : dflt;
 }
 
+// 取字符串字段；缺省或类型不对就用 dflt（不返回 NULL，省掉每个调用点的判空）。
+static const char *str_field(const cJSON *root, const char *name, const char *dflt) {
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(root, name);
+    return cJSON_IsString(it) && it->valuestring && *it->valuestring ? it->valuestring : dflt;
+}
+
 void terminal_link_dispatch(char *line, const link_reply_t *reply) {
     if (!line || !*line) return;
 
@@ -476,6 +482,46 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
             reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.play_tone\",\"err\":\"busy\"}\n",
                       id);
         }
+    } else if (strcmp(c, "vendor.tcp_sink") == 0) {
+        // 对任意 TCP 主机猛读，量真实字节速率：绕开 PAV1/播放/对端服务器。
+        const char *host = str_field(root, "host", terminal_net_host());
+        const int port = int_field(root, "port", 18181);
+        const int ms = int_field(root, "ms", 3000);
+        const esp_err_t err = terminal_net_sink_test(host, port, ms);
+        if (err == ESP_OK) {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.tcp_sink\",\"host\":\"%s\","
+                      "\"port\":%d,\"ms\":%d}\n",
+                      id, host, port, ms);
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.tcp_sink\",\"err\":\"no_mem\"}\n",
+                      id);
+        }
+    } else if (strcmp(c, "vendor.rtt") == 0) {
+        // 从设备侧量到服务器的真实 RTT 与 SYN 失败率：判断"是不是在窄带 WAN 上"。
+        const char *host = str_field(root, "host", terminal_net_host());
+        const int port = int_field(root, "port", terminal_net_port());
+        const int tries = int_field(root, "tries", 6);
+        const esp_err_t err = terminal_net_rtt_test(host, port, tries);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":%s,\"cmd\":\"vendor.rtt\",\"host\":\"%s\",\"port\":%d}\n",
+                  id, err == ESP_OK ? "true" : "false", host, port);
+    } else if (strcmp(c, "vendor.tcp_accept") == 0) {
+        // 设备监听、对端连进来灌数据：绕开 Windows 入站防火墙，测同一段接收路径。
+        const int port = int_field(root, "port", 18182);
+        const esp_err_t err = terminal_net_accept_test(port);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":%s,\"cmd\":\"vendor.tcp_accept\",\"port\":%d}\n", id,
+                  err == ESP_OK ? "true" : "false", port);
+    } else if (strcmp(c, "vendor.rx_rate") == 0) {
+        // 只读不播：把"读循环上限"和"播放路径开销"分开量。
+        const int ms = int_field(root, "ms", 2000);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.rx_rate\",\"ms\":%d}\n", id, ms);
+        terminal_pav1_rx_rate_start(ms);
+    } else if (strcmp(c, "vendor.wifi_ps") == 0) {
+        // 0=NONE 1=MIN_MODEM 2=MAX_MODEM，运行时切换以便 A/B。
+        const int mode = int_field(root, "mode", 0);
+        const esp_err_t err = terminal_net_set_ps(mode);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":%s,\"cmd\":\"vendor.wifi_ps\",\"mode\":%d}\n", id,
+                  err == ESP_OK ? "true" : "false", mode);
     } else if (strcmp(c, "vendor.capture_arm") == 0) {
         // 厂商扩展：按键起采的等价入口，用来在没有人在设备旁边时验证 pre-roll。
         terminal_capture_arm();

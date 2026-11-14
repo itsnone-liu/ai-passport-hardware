@@ -399,6 +399,12 @@ static void net_event_handler(void *arg, esp_event_base_t base, int32_t event_id
         const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
         ESP_LOGI(TAG, "拿到 IP " IPSTR, IP2STR(&ev->ip_info.ip));
         s_ip_ready = true;
+        // 实时语音链路必须关掉 Wi-Fi 省电。默认是 WIFI_PS_MIN_MODEM，设备每
+        // DTIM 周期才醒一次收包（实测 listen interval 300 ms），下行数据在 AP
+        // 那里排队等设备醒来，表现为接收速率"一阵一阵"、低速脉冲，而且会把
+        // RTT 凭空拉长。省的那点电换不来一句正常的话。
+        const esp_err_t ps_err = esp_wifi_set_ps(WIFI_PS_NONE);
+        ESP_LOGI(TAG, "关闭 Wi-Fi 省电：%s", esp_err_to_name(ps_err));
     }
 }
 
@@ -639,3 +645,255 @@ done:
 bool terminal_net_ready(void) { return s_connected; }
 
 bool terminal_net_ip_ready(void) { return s_ip_ready; }
+// ---- 下行吞吐隔离测试：对任意 TCP 主机猛读，量真实的字节速率 ----
+// 不经过 PAV1、不经过播放、不经过处暑的服务器。用来把"链路/lwIP/读循环"
+// 和"协议/播放"彻底切开：本机起一个只会灌数据的 sink 就能做 A/B。
+static void sink_task(void *arg) {
+    char *spec = (char *)arg;  // "host port ms"
+    char host[48] = {0};
+    int port = 0, ms = 3000;
+    if (sscanf(spec, "%47s %d %d", host, &port, &ms) != 3) {
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_sink\",\"ok\":false,\"err\":\"bad_args\"}\n");
+        free(spec);
+        vTaskDelete(NULL);
+        return;
+    }
+    free(spec);
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[8];
+    snprintf(portstr, sizeof portstr, "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_sink\",\"ok\":false,\"err\":\"resolve\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    const int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        freeaddrinfo(res);
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_sink\",\"ok\":false,\"err\":\"socket\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    const struct timeval rcv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof rcv);
+    int rcvbuf = 16384;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        close(fd);
+        freeaddrinfo(res);
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_sink\",\"ok\":false,\"err\":\"connect\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    freeaddrinfo(res);
+    static uint8_t buf[4096];
+    uint32_t total = 0;
+    int calls = 0;
+    const int64_t t0 = esp_timer_get_time();
+    while ((esp_timer_get_time() - t0) / 1000 < ms) {
+        const int n = recv(fd, buf, sizeof buf, 0);
+        calls++;
+        if (n > 0) {
+            total += (uint32_t)n;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            break;
+        }
+    }
+    const int elapsed = (int)((esp_timer_get_time() - t0) / 1000);
+    close(fd);
+    const uint32_t kbps_x10 = elapsed ? (uint32_t)((uint64_t)total * 10 / (uint64_t)elapsed) : 0;
+    ESP_LOGI(TAG, "tcp_sink: %u B / %d ms = %u.%u KB/s，%d 次 recv", (unsigned)total, elapsed,
+             (unsigned)(kbps_x10 / 10), (unsigned)(kbps_x10 % 10), calls);
+    char ev[288];
+    snprintf(ev, sizeof ev,
+             "{\"event\":\"tcp_sink\",\"ok\":true,\"host\":\"%s\",\"port\":%d,\"ms\":%d,"
+             "\"bytes\":%u,\"kbps\":%u.%u,\"calls\":%d,\"heap\":%u,\"heap_min\":%u}\n",
+             host, port, elapsed, (unsigned)total, (unsigned)(kbps_x10 / 10),
+             (unsigned)(kbps_x10 % 10), calls,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT));
+    terminal_link_send_src(LINK_SRC_USB, ev);
+    vTaskDelete(NULL);
+}
+
+esp_err_t terminal_net_sink_test(const char *host, int port, int ms) {
+    char *spec = malloc(64);
+    if (!spec) return ESP_ERR_NO_MEM;
+    snprintf(spec, 64, "%s %d %d", host, port, ms);
+    if (xTaskCreate(sink_task, "sink", 4096, spec, 4, NULL) != pdPASS) {
+        free(spec);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+// 运行时切换 Wi-Fi 省电模式，用于 A/B：0=NONE 1=MIN_MODEM 2=MAX_MODEM
+esp_err_t terminal_net_set_ps(int mode) {
+    return esp_wifi_set_ps(mode == 0 ? WIFI_PS_NONE
+                                     : (mode == 2 ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM));
+}
+
+// ---- 反向吞吐测试：设备监听，对端连进来猛灌 ----
+// 为什么反过来：Windows 防火墙默认挡跨主机入站，加规则要管理员权限；
+// 出站不受限。接收路径（lwIP 窗口/pbuf/recv 循环）两个方向完全一样，
+// 所以"谁主动连"不影响要测的东西。产品里设备永不监听，这里只是厂商调试。
+static void accept_task(void *arg) {
+    const int port = (int)(intptr_t)arg;
+    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_accept\",\"ok\":false,\"err\":\"socket\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 1) != 0) {
+        close(fd);
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_accept\",\"ok\":false,\"err\":\"bind\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    // 监听 30 s 等对端来连；连上后最多收 20 s。
+    struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    const int conn = accept(fd, NULL, NULL);
+    close(fd);
+    if (conn < 0) {
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"tcp_accept\",\"ok\":false,\"err\":\"accept_timeout\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    int rcvbuf = 16384;
+    setsockopt(conn, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    tv.tv_sec = 2;
+    setsockopt(conn, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    static uint8_t buf[4096];
+    uint32_t total = 0;
+    int calls = 0;
+    const int64_t t0 = esp_timer_get_time();
+    for (;;) {
+        const int n = recv(conn, buf, sizeof buf, 0);
+        calls++;
+        if (n > 0) {
+            total += (uint32_t)n;
+            if ((esp_timer_get_time() - t0) / 1000 > 20000) break;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            break;
+        } else {
+            break;  // 2 s 没数据就当结束
+        }
+    }
+    const int elapsed = (int)((esp_timer_get_time() - t0) / 1000);
+    close(conn);
+    const uint32_t kbps_x10 = elapsed ? (uint32_t)((uint64_t)total * 10 / (uint64_t)elapsed) : 0;
+    ESP_LOGI(TAG, "tcp_accept: %u B / %d ms = %u.%u KB/s，%d 次 recv", (unsigned)total, elapsed,
+             (unsigned)(kbps_x10 / 10), (unsigned)(kbps_x10 % 10), calls);
+    char ev[288];
+    snprintf(ev, sizeof ev,
+             "{\"event\":\"tcp_accept\",\"ok\":true,\"port\":%d,\"bytes\":%u,\"ms\":%d,"
+             "\"kbps\":%u.%u,\"calls\":%d,\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u}\n",
+             port, (unsigned)total, elapsed, (unsigned)(kbps_x10 / 10),
+             (unsigned)(kbps_x10 % 10), calls,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    terminal_link_send_src(LINK_SRC_USB, ev);
+    vTaskDelete(NULL);
+}
+
+esp_err_t terminal_net_accept_test(int port) {
+    if (port <= 0 || port > 65535) return ESP_ERR_INVALID_ARG;
+    return xTaskCreate(accept_task, "acc", 4096, (void *)(intptr_t)port, 4, NULL) == pdPASS
+               ? ESP_OK
+               : ESP_ERR_NO_MEM;
+}
+
+// ---- 路径质量测量：n 次 TCP 连接（SYN→SYN-ACK 完成即一个 RTT）----
+// 连接失败也算一次样本：SYN 丢了就是最直接的丢包证据。
+static void rtt_task(void *arg) {
+    char *spec = (char *)arg;
+    char host[48] = {0};
+    int port = 0, n = 6;
+    if (sscanf(spec, "%47s %d %d", host, &port, &n) != 3) {
+        free(spec);
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"rtt\",\"ok\":false,\"err\":\"bad_args\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    free(spec);
+    if (n > 20) n = 20;
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[8];
+    snprintf(portstr, sizeof portstr, "%d", port);
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
+        terminal_link_send_src(LINK_SRC_USB, "{\"event\":\"rtt\",\"ok\":false,\"err\":\"resolve\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    int ok = 0, fail = 0, min_ms = 100000, max_ms = 0, sum_ms = 0;
+    for (int i = 0; i < n; i++) {
+        const int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+        if (fd < 0) {
+            fail++;
+            continue;
+        }
+        // 连接超时要短于默认值：这里量的是"能不能在一个 RTT 内握上手"。
+        struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        const int64_t t0 = esp_timer_get_time();
+        const int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+        const int ms = (int)((esp_timer_get_time() - t0) / 1000);
+        close(fd);
+        if (rc == 0) {
+            ok++;
+            sum_ms += ms;
+            if (ms < min_ms) min_ms = ms;
+            if (ms > max_ms) max_ms = ms;
+        } else {
+            fail++;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    freeaddrinfo(res);
+    const int avg = ok ? sum_ms / ok : 0;
+    ESP_LOGI(TAG, "rtt: %s:%d ok=%d fail=%d min=%d avg=%d max=%d ms", host, port, ok, fail,
+             ok ? min_ms : 0, avg, max_ms);
+    char ev[256];
+    snprintf(ev, sizeof ev,
+             "{\"event\":\"rtt\",\"ok\":true,\"host\":\"%s\",\"port\":%d,\"tries\":%d,"
+             "\"success\":%d,\"fail\":%d,\"min_ms\":%d,\"avg_ms\":%d,\"max_ms\":%d}\n",
+             host, port, n, ok, fail, ok ? min_ms : 0, avg, max_ms);
+    terminal_link_send_src(LINK_SRC_USB, ev);
+    vTaskDelete(NULL);
+}
+
+esp_err_t terminal_net_rtt_test(const char *host, int port, int tries) {
+    char *spec = malloc(64);
+    if (!spec) return ESP_ERR_NO_MEM;
+    snprintf(spec, 64, "%s %d %d", host, port, tries);
+    if (xTaskCreate(rtt_task, "rtt", 4096, spec, 4, NULL) != pdPASS) {
+        free(spec);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}

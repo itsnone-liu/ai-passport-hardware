@@ -181,6 +181,7 @@ static volatile bool s_ready;
 static char s_host[64];
 static int s_port;
 static uint32_t s_rx_frames, s_rx_bytes, s_rx_end, s_tx_frames, s_tx_bytes;
+static volatile bool s_rx_only;  // 隔离实验期间：只收不播
 static volatile uint32_t s_rx_bad;
 static pav1_err_t s_last_err;
 static volatile bool s_ul_req;
@@ -409,12 +410,13 @@ static void serve_frame(void *ctx, pav1_kind_t kind, uint32_t turn_id, const uin
     if (kind == PAV1_K_PCM) {
         s_rx_frames++;
         s_rx_bytes += (uint32_t)n;
+        if (s_rx_only) return;  // 隔离实验：只读不播，量读循环本身的上限
         // 收到的每一帧都交给播放环：轮次对不对、缓冲满不满由它判定并计数。
         terminal_playback_push(turn_id, payload, n);
     } else if (kind == PAV1_K_END) {
         s_rx_end++;
         ESP_LOGI(TAG, "收到 END turn=%u", (unsigned)turn_id);
-        terminal_playback_mark_end(turn_id);  // 环里剩的放完再收轮
+        if (!s_rx_only) terminal_playback_mark_end(turn_id);  // 环里剩的放完再收轮
     } else {
         ESP_LOGW(TAG, "运行期收到非音频帧 kind=%d turn=%u", (int)kind, (unsigned)turn_id);
     }
@@ -549,6 +551,49 @@ bool terminal_pav1_ready(void) { return s_ready; }
 uint32_t terminal_pav1_rx_frames(void) { return s_rx_frames; }
 uint32_t terminal_pav1_rx_end(void) { return s_rx_end; }
 uint32_t terminal_pav1_tx_frames(void) { return s_tx_frames; }
+
+// ---- 隔离实验：只从音频 socket 读、解析、计数，不推环、不播放 ----
+// 目的：把"读循环的上限"和"播放路径的开销"分开量。若这里也只有 15–25 帧/秒，
+// 瓶颈在读循环/链路；若这里能到 50+ 帧/秒，说明是播放路径把读拖慢了。
+static void rx_rate_task(void *arg) {
+    const int ms = (int)(intptr_t)arg;
+    if (!s_ready || s_sock < 0) {
+        terminal_link_send_src(LINK_SRC_USB,
+                               "{\"event\":\"rx_rate\",\"ok\":false,\"err\":\"no_audio\"}\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    const uint32_t f0 = s_rx_frames, b0 = s_rx_bytes;
+    const int64_t t0 = esp_timer_get_time();
+    s_rx_only = true;
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    s_rx_only = false;
+    const int64_t dt = esp_timer_get_time() - t0;
+    const uint32_t df = s_rx_frames - f0, db = s_rx_bytes - b0;
+    const int elapsed_ms = (int)(dt / 1000);
+    const int fps_x10 = elapsed_ms ? (int)((int64_t)df * 10000 / elapsed_ms) : 0;
+    const int kbps_x10 = elapsed_ms ? (int)((int64_t)db * 10 / elapsed_ms) : 0;
+    ESP_LOGI(TAG, "rx_rate: %u 帧 / %u B / %d ms = %d.%d 帧/秒 = %d.%d KB/s", (unsigned)df,
+             (unsigned)db, elapsed_ms, fps_x10 / 10, fps_x10 % 10, kbps_x10 / 10, kbps_x10 % 10);
+    char ev[288];
+    snprintf(ev, sizeof ev,
+             "{\"event\":\"rx_rate\",\"ok\":true,\"ms\":%d,\"frames\":%u,\"bytes\":%u,"
+             "\"fps\":%d.%d,\"kbps\":%d.%d,\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u}\n",
+             elapsed_ms, (unsigned)df, (unsigned)db, fps_x10 / 10, fps_x10 % 10, kbps_x10 / 10,
+             kbps_x10 % 10, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    terminal_link_send_src(LINK_SRC_USB, ev);
+    (void)t0;
+    vTaskDelete(NULL);
+}
+
+esp_err_t terminal_pav1_rx_rate_start(int ms) {
+    if (ms <= 0 || ms > 10000) return ESP_ERR_INVALID_ARG;
+    return xTaskCreate(rx_rate_task, "rx_rate", 3072, (void *)(intptr_t)ms, 4, NULL) == pdPASS
+               ? ESP_OK
+               : ESP_ERR_NO_MEM;
+}
 
 bool terminal_pav1_starting(void) { return s_should_run && !s_ready; }
 

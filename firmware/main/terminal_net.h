@@ -46,3 +46,7 @@ int terminal_net_port(void);
 // 扫描周边 AP，写成 JSON 数组（最多 12 个，按信号排序）。成功返回 ESP_OK。
 // 注意：扫描会短暂断开当前连接，之后由重连逻辑自动恢复。
 esp_err_t terminal_net_scan(char *buf, size_t n);
+esp_err_t terminal_net_sink_test(const char *host, int port, int ms);
+esp_err_t terminal_net_set_ps(int mode);
+esp_err_t terminal_net_accept_test(int port);
+esp_err_t terminal_net_rtt_test(const char *host, int port, int tries);

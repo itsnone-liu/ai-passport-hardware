@@ -47,5 +47,10 @@ CONFIG_TERMINAL_WIFI_PASSWORD="dsh-lab-pass"
 CONFIG_TERMINAL_SERVER_HOST="host.emu.internal"
 CONFIG_TERMINAL_SERVER_PORT=8080
 
-# 娑撳顢戦棅鎶筋暥閿?05 ms RTT 鑴?31.2 KB/s = 6.4 KB 閻ㄥ嫬鐢€硅棄娆㈡潻鐔盒濋敍灞藉斧閺夈儳娈?5760 B 缁愭褰涢悧鈺冩倞娑撳﹨绐囨稉宥嗗姬鐎圭偞妞傞妴?CONFIG_LWIP_TCP_WND_DEFAULT=16384
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+# 娑撳顢戦棅鎶筋暥閿?05 ms RTT 鑴?31.2 KB/s = 6.4 KB 閻ㄥ嫬鐢€硅棄娆㈡潻鐔盒濋敍灞藉斧閺夈儳娈?5760 B 缁愭褰涢悧鈺冩倞娑撳﹨绐囨稉宥嗗姬鐎圭偞妞傞妴?CONFIG_LWIP_TCP_WND_DEFAULT=32768
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=32768
+
+# 窄带 WAN（205 ms RTT）上丢一个段就意味着拥塞窗口回退：
+# 接收端会 SACK、乱序段多留一些，别让发送方从 1 个 MSS 重新长起来。
+CONFIG_LWIP_TCP_SACK_OUT=y
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=16

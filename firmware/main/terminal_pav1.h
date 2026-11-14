@@ -4,6 +4,7 @@
 // 解析器同一时刻只持有一个未完成帧（无 PSRAM，宁可报错也不预分配）。
 #pragma once
 
+#include "esp_err.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -55,6 +56,14 @@ void terminal_pav1_start(const char *host, int port);
 // 控制通道断开 = 会话作废，音频通道必须一起关（session_id 不再有效）。
 void terminal_pav1_stop(void);
 bool terminal_pav1_ready(void);
+
+// 音频通道累计收发计数（get_audio 排障用）。
+uint32_t terminal_pav1_rx_frames(void);
+uint32_t terminal_pav1_rx_end(void);
+uint32_t terminal_pav1_tx_frames(void);
+
+// 隔离实验：ms 毫秒内只读音频 socket 并计数（不推环、不播放），报帧/秒与堆。
+esp_err_t terminal_pav1_rx_rate_start(int ms);
 
 // 音频通道累计收发计数（get_audio 排障用）：
 // rx = 从服务端收到的 PCM 帧数（不含 END），tx = 已发出的 PCM 帧数。
