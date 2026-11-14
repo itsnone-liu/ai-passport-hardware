@@ -186,6 +186,28 @@ class TestSecurity(ServiceCase):
         self.assertIn("bad_magic", codes, self.dev.events)
 
 
+class TestAudioSurvivesControlReconnect(ServiceCase):
+    """The device dials its audio channel once per boot, not per turn.
+
+    A control-channel blip therefore leaves a live audio socket behind. If the
+    server strands that link in the dead session, the peer's window never opens
+    again: EAGAIN on every send while both sides still see a healthy socket.
+    """
+
+    async def test_live_audio_link_is_adopted_by_the_new_session(self):
+        audio_link = self.svc.session_of(DEVICE).audio
+        await self.dev.reconnect_control()
+        for _ in range(100):
+            if self.svc.session_of(DEVICE) is not None:
+                break
+            await asyncio.sleep(0.02)
+        session = self.svc.session_of(DEVICE)
+        self.assertIs(audio_link, session.audio, "the live audio link must be adopted")
+        result = await self.dev.converse(UPLOAD)
+        self.assertGreater(len(result["audio"]), 0,
+                           "capture on the adopted link must still work")
+
+
 class TestReconnect(ServiceCase):
     async def test_reconnect_gets_new_session_and_turns_restart(self):
         first = await self.dev.converse(UPLOAD)

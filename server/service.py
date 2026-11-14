@@ -185,6 +185,8 @@ class AudioLink:
         self.authed = False
         self.closed = False
         self._write_lock = asyncio.Lock()
+        self._bytes_read = 0
+        self._last_stats = 0.0
         self._cap_send_buffer()
 
     def _cap_send_buffer(self) -> None:
@@ -223,7 +225,13 @@ class AudioLink:
         try:
             while True:
                 chunk = await self.reader.read(4096)
-                log.debug("%s audio read %d bytes", self.session.device_id, len(chunk or b""))
+                if chunk:
+                    self._bytes_read += len(chunk)
+                    now = asyncio.get_running_loop().time()
+                    if now - self._last_stats >= 5.0:
+                        self._last_stats = now
+                        log.info("%s audio link alive: %d bytes read so far",
+                                 self.session.device_id, self._bytes_read)
                 if not chunk:
                     break
                 try:
@@ -978,6 +986,9 @@ class Service:
         self.brain = brain
         self.sessions: Dict[str, Session] = {}
         self.by_session_id: Dict[str, Session] = {}
+        # Live audio links by device: the socket outlives a control reconnect, so
+        # it needs a home that is not a Session.
+        self.audio_links: Dict[str, "AudioLink"] = {}
         self.control_port = cfg.control_port
         self.audio_port = cfg.audio_port
         self.audio_enabled = True
@@ -1233,6 +1244,17 @@ class Service:
             session = Session(self, device_id, secrets.token_hex(8))
             link = ControlLink(session, reader, writer)
             session.control = link
+            live_audio = self.audio_links.get(device_id)
+            if live_audio is not None and live_audio.authed:
+                # The device dials its audio channel once per boot and keeps it
+                # across control reconnects. Leaving that link bound to the dead
+                # session means nobody reads it: the peer's window stays shut and
+                # every frame is refused with EAGAIN while the socket still looks
+                # alive on both ends.
+                session.audio = live_audio
+                live_audio.session = session
+                log.info("%s adopted the live audio link into session %s",
+                         device_id, session.session_id[:8])
             if not provisioned:
                 # Dev compatibility (protocol §11): an unprovisioned device still
                 # needs a working link, and it needs it under its real device id
@@ -1364,6 +1386,11 @@ class Service:
                 await session.audio.close()
             link = AudioLink(session, reader, writer, framer=framer)
             session.audio = link
+            # The socket outlives control reconnects, so it needs a home that is
+            # not a Session: a dead session's audio link would otherwise be
+            # adopted by nobody and every send would be refused with EAGAIN while
+            # both ends still see a healthy connection.
+            self.audio_links[session.device_id] = link
             try:
                 await session.on_audio_hello(link, obj)
             except (PermissionError, ProtocolViolation) as exc:
@@ -1385,6 +1412,8 @@ class Service:
         finally:
             if session is not None and session.audio is link:
                 session.audio = None
+            if session is not None and self.audio_links.get(session.device_id) is link:
+                self.audio_links.pop(session.device_id, None)
             if session is not None and session.state in (STATE_LISTENING, STATE_SPEAKING):
                 session.state = STATE_IDLE
                 session.active_turn = None

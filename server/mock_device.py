@@ -139,6 +139,31 @@ class MockPassport:
                 raise TimeoutError("no audio auth ack")
             await asyncio.sleep(0.01)
 
+    async def reconnect_control(self, timeout: float = 5.0) -> None:
+        """Drop only the control channel, as a Wi-Fi blip would.
+
+        The audio socket stays open -- that is what the firmware does, and the
+        server must adopt that live link into the new session instead of
+        stranding it.
+        """
+        if self.control_writer:
+            self.control_writer.close()
+        if self._control_task:
+            self._control_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._control_task
+        self.pending.clear()
+        self.control_reader, self.control_writer = await asyncio.wait_for(
+            asyncio.open_connection(self.host, self.control_port), timeout=timeout)
+        self._control_task = asyncio.create_task(self._control_loop())
+        import hashlib as _hashlib
+        self.device_nonce = _hashlib.sha256(f"{self.device_id}-{time.time_ns()}".encode()).hexdigest()[:32]
+        reply = await self.request("hello", proto="v1", device_id=self.device_id,
+                                   nonce=self.device_nonce, timeout=timeout)
+        self.session_id = reply["session_id"]
+        self.server_nonce = reply["server_nonce"]
+        await self.request("auth", mac=self._mac("control"), timeout=timeout)
+
     async def close(self) -> None:
         self._closed = True
         for task in (self._control_task, self._audio_task):
