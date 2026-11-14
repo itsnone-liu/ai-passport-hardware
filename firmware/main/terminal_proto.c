@@ -50,7 +50,11 @@ static void proto_task(void *arg) {
                     terminal_link_send("{\"ok\":false,\"err\":\"line_too_long\"}\n");
                 } else {
                     line[len] = '\0';
-                    if (len > 0) terminal_link_dispatch(line);
+                    if (len > 0) {
+                        // USB 是唯一允许 provision 的载体，所以来源必须显式带上
+                        static const link_reply_t k_usb_reply = {LINK_SRC_USB, usb_sink};
+                        terminal_link_dispatch(line, &k_usb_reply);
+                    }
                 }
                 len = 0;
             } else if (discard) {

@@ -150,7 +150,11 @@ static void feed(const char *data, int len) {
                 terminal_link_send("{\"ok\":false,\"err\":\"line_too_long\"}\n");
             } else {
                 s_line[s_line_len] = '\0';
-                if (s_line_len > 0) terminal_link_dispatch(s_line);
+                if (s_line_len > 0) {
+                    // 应答只回这条 TCP 连接：USB 同时在线时不能把应答广播过去。
+                    static const link_reply_t k_tcp_reply = {LINK_SRC_TCP, tcp_sink};
+                    terminal_link_dispatch(s_line, &k_tcp_reply);
+                }
             }
             s_line_len = 0;
         } else if (s_rx_discard) {

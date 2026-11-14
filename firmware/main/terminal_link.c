@@ -76,17 +76,23 @@ void terminal_link_send(const char *line) {
     for (int i = 0; i < s_sink_count; i++) s_sinks[i](line, n);
 }
 
-static void send_fmt(const char *fmt, ...) {
+// 应答组包：只发回请求来源。与 send_fmt 分开是因为广播和定向的语义不同，
+// 混用会让"谁的应答"变成靠运气。
+static void reply_fmt(const link_reply_t *to, const char *fmt, ...) {
     if (s_tx_mu) xSemaphoreTake(s_tx_mu, portMAX_DELAY);
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(s_tx, sizeof s_tx, fmt, ap);
+    const int n = vsnprintf(s_tx, sizeof s_tx, fmt, ap);
     va_end(ap);
-    terminal_link_send(s_tx);
+    if (to && to->sink) {
+        to->sink(s_tx, (n > 0 && (size_t)n < sizeof s_tx) ? (size_t)n : strlen(s_tx));
+    } else {
+        terminal_link_send(s_tx);  // 没有来源信息时才退化成广播
+    }
     if (s_tx_mu) xSemaphoreGive(s_tx_mu);
 }
 
-static void reply_status(int id) {
+static void reply_status(const link_reply_t *to, int id) {
     const int soc = bsp_battery_soc();
     const int mv = bsp_battery_mv();
     const int64_t up = (esp_timer_get_time() - s_boot_us) / 1000000;
@@ -96,11 +102,11 @@ static void reply_status(int id) {
     const unsigned heap_min = (unsigned)esp_get_minimum_free_heap_size();
     const unsigned heap_blk =
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
-    send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"status\",\"battery\":%d,\"mv\":%d,"
-             "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld,"
-             "\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u}\n",
-             id, soc, mv, terminal_ui_volume(), terminal_ui_brightness(), (long long)up, heap_now,
-             heap_min, heap_blk);
+    reply_fmt(to, "{\"id\":%d,\"ok\":true,\"cmd\":\"status\",\"battery\":%d,\"mv\":%d,"
+                  "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld,"
+                  "\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u}\n",
+              id, soc, mv, terminal_ui_volume(), terminal_ui_brightness(), (long long)up, heap_now,
+              heap_min, heap_blk);
 }
 
 static void apply_volume(int value) {
@@ -137,7 +143,7 @@ static int int_field(const cJSON *root, const char *name, int dflt) {
     return cJSON_IsNumber(it) ? it->valueint : dflt;
 }
 
-void terminal_link_dispatch(char *line) {
+void terminal_link_dispatch(char *line, const link_reply_t *reply) {
     if (!line || !*line) return;
 
     // 只处理以 '{' 开头的行。接到的可能不是我们自己人：路由器/HTTP 网关/任何误连上来
@@ -149,38 +155,39 @@ void terminal_link_dispatch(char *line) {
     cJSON *root = cJSON_Parse(line);
     if (!root) {
         // 以 '{' 开头却解析失败，多半是真正想调命令却拼错了，此时报错才有助于调试。
-        terminal_link_send("{\"ok\":false,\"err\":\"bad_json\"}\n");
+        reply_fmt(reply, "{\"ok\":false,\"err\":\"bad_json\"}\n");
         return;
     }
 
     const int id = int_field(root, "id", 0);
     const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "cmd");
     if (!cJSON_IsString(cmd)) {
-        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"no cmd\"}\n", id);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"err\":\"no cmd\"}\n", id);
         cJSON_Delete(root);
         return;
     }
 
     const char *c = cmd->valuestring;
     if (strcmp(c, "get_status") == 0) {
-        reply_status(id);
+        reply_status(reply, id);
     } else if (strcmp(c, "show_text") == 0) {
         const cJSON *t = cJSON_GetObjectItemCaseSensitive(root, "text");
         if (apply_text(cJSON_IsString(t) ? t->valuestring : "")) {
-            send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"show_text\"}\n", id);
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"show_text\"}\n", id);
         } else {
-            send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"show_text\",\"err\":\"display busy\"}\n", id);
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"show_text\",\"err\":\"display busy\"}\n",
+                      id);
         }
     } else if (strcmp(c, "set_volume") == 0) {
         apply_volume(int_field(root, "value", terminal_ui_volume()));
-        send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"set_volume\",\"volume\":%d}\n", id,
-                 terminal_ui_volume());
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"set_volume\",\"volume\":%d}\n", id,
+                  terminal_ui_volume());
     } else if (strcmp(c, "set_brightness") == 0) {
         apply_brightness(int_field(root, "value", terminal_ui_brightness()));
-        send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"set_brightness\",\"brightness\":%d}\n", id,
-                 terminal_ui_brightness());
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"set_brightness\",\"brightness\":%d}\n",
+                  id, terminal_ui_brightness());
     } else if (strcmp(c, "ping") == 0) {
-        send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"pong\"}\n", id);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"pong\"}\n", id);
     } else if (strcmp(c, "set_net") == 0) {
         // 现场改网络参数：换 Wi-Fi 或换服务器地址不必重新刷固件。
         const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(root, "ssid");
@@ -195,25 +202,26 @@ void terminal_link_dispatch(char *line) {
             cJSON_IsString(host) ? host->valuestring : NULL,
             cJSON_IsNumber(port) ? port->valueint : 0);
         if (err == ESP_OK) {
-            send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"set_net\"}\n", id);
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"set_net\"}\n", id);
             terminal_net_reconnect();  // 回执已经发出去了，这时断链才安全
         } else {
-            send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"set_net\",\"err\":\"apply failed\"}\n", id);
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"set_net\",\"err\":\"apply failed\"}\n",
+                      id);
         }
     } else if (strcmp(c, "get_net") == 0) {
         // ssid/host 转义后最长约 6 倍，256 装不下一个含中文或引号的 SSID
         char body[768];
         terminal_net_describe(body, sizeof body);
-        send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"net\",%s}\n", id, body);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"net\",%s}\n", id, body);
     } else if (strcmp(c, "scan") == 0) {
         // 现场诊断用：列出芯片实际看得见的 2.4 GHz 热点。
         static char s_scan[1024];
         const esp_err_t err = terminal_net_scan(s_scan, sizeof s_scan);
         if (err == ESP_OK) {
-            send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"scan\",%s}\n", id, s_scan);
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"scan\",%s}\n", id, s_scan);
         } else {
-            send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"scan\",\"err\":\"%s\"}\n", id,
-                     esp_err_to_name(err));
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"scan\",\"err\":\"%s\"}\n", id,
+                      esp_err_to_name(err));
         }
     } else if (strcmp(c, "audio_selftest") == 0) {
         // 设备侧音频自测：录一段再原样回放，用来验证 codec 采播与帧时序。
@@ -221,13 +229,14 @@ void terminal_link_dispatch(char *line) {
         const int frame_ms = int_field(root, "frame_ms", 20);
         const esp_err_t err = terminal_audio_selftest_start(ms, frame_ms);
         if (err == ESP_OK) {
-            send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"audio_selftest\",\"ms\":%d}\n", id, ms);
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"audio_selftest\",\"ms\":%d}\n", id,
+                      ms);
         } else {
-            send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"audio_selftest\",\"err\":\"%s\"}\n", id,
-                     esp_err_to_name(err));
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"audio_selftest\",\"err\":\"%s\"}\n",
+                      id, esp_err_to_name(err));
         }
     } else {
-        send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"unknown_cmd\"}\n", id);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"err\":\"unknown_cmd\"}\n", id);
     }
 
     cJSON_Delete(root);
@@ -235,6 +244,10 @@ void terminal_link_dispatch(char *line) {
 
 void terminal_link_emit_key(int btn_index, int ev_index) {
     if (s_sink_count == 0) return;
-    send_fmt("{\"event\":\"key\",\"btn\":\"%s\",\"ev\":\"%s\"}\n", btn_name(btn_index),
-             ev_name(ev_index));
+    // 按键是事件，按协议 §6.2 广播给所有载体（不放 reply_fmt：它没有"请求"可回）。
+    if (s_tx_mu) xSemaphoreTake(s_tx_mu, portMAX_DELAY);
+    snprintf(s_tx, sizeof s_tx, "{\"event\":\"key\",\"btn\":\"%s\",\"ev\":\"%s\"}\n",
+             btn_name(btn_index), ev_name(ev_index));
+    terminal_link_send(s_tx);
+    if (s_tx_mu) xSemaphoreGive(s_tx_mu);
 }
