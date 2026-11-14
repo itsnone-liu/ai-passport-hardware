@@ -968,6 +968,40 @@ class Session:
                 with contextlib.suppress(asyncio.CancelledError):
                     await producer
 
+    # -- 下行 FEC（3 块一组 + 1 块 XOR 奇偶）-------------------------------
+    def _sign_send(self, turn_id: int, payload: bytes, flags: int) -> bool:
+        """签名并发一包。返回 False = 现在发不出去（调用方退回 TCP）。"""
+        secret = self._secret()
+        if secret is None:
+            return False
+        body = audio_udp.build(audio_udp.KIND_ADPCM, turn_id, payload, flags=flags)
+        try:
+            self.udp_transport.sendto(
+                body + audio_udp.sign(secret, body, audio_udp.MAC_AUDIO), self.udp_peer)
+        except OSError:
+            return False
+        return True
+
+    def _fec_add(self, seq: int, blk: bytes) -> None:
+        if seq % 3 == 0 or not getattr(self, "_fec_acc", None):
+            self._fec_base = seq
+            self._fec_acc = bytearray(blk)
+            return
+        for i, b in enumerate(blk):
+            self._fec_acc[i] ^= b
+
+    def _fec_close(self, seq: int):
+        """组满（seq % 3 == 2）时返回奇偶块载荷，否则 None。"""
+        if seq % 3 != 2 or not getattr(self, "_fec_acc", None):
+            return None
+        import struct as _struct
+        return _struct.pack("<I", self._fec_base & 0xFFFFFFFF) + bytes(self._fec_acc)
+
+    def _should_drop(self, seq: int) -> bool:
+        """台架专用：按固定步长丢掉音频块，只为验证奇偶真的能救回来。"""
+        every = getattr(self, "_drop_every", 0)
+        return bool(every) and (seq % every == 0)
+
     def _secret(self):
         """本设备的共享密钥；没有就返回 None（此时 UDP 一律不发）。"""
         try:
@@ -995,20 +1029,21 @@ class Session:
             payload = adpcm.encode_payload(use, blk)
             self._down_seq = ((use + 1) if seq is None
                               else max(self._down_seq, use + 1)) & 0xFFFFFFFF
-            body = audio_udp.build(audio_udp.KIND_ADPCM, turn_id, payload)
-            secret = self._secret()
-            if secret is None:          # 没有密钥就不发未签名的包，宁可退回 TCP
-                self.udp_peer = None
-                await self.send_down_frame(turn_id, frame)
-                return
-            dgram = body + audio_udp.sign(secret, body, audio_udp.MAC_AUDIO)
-            try:
-                self.udp_transport.sendto(dgram, self.udp_peer)
-            except OSError:
-                self.udp_peer = None      # fall back at once: a silent turn is worse
-                await self.send_down_frame(turn_id, frame)
-                return
-            self.down_udp_frames += 1
+            # 先把这一块并入奇偶，再决定发不发。顺序不能反：台架 drop_every
+            # 会故意丢掉某些块，那些块必须已经被算进奇偶里，否则"丢了还能
+            # 恢复"就是假的。
+            self._fec_add(use, blk)
+            sent = 0
+            if not self._should_drop(use):
+                if not self._sign_send(turn_id, payload, 0):
+                    self.udp_peer = None
+                    await self.send_down_frame(turn_id, frame)
+                    return
+                sent += 1
+            group = self._fec_close(use)
+            if group is not None and self._sign_send(turn_id, group, audio_udp.FLAG_FEC):
+                sent += 1
+            self.down_udp_frames += sent
             return
         await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)
 
@@ -1410,6 +1445,7 @@ class Service:
                 import math
                 import struct as _struct
                 shuffle = bool(req.get("shuffle", False))
+                session._drop_every = int(req.get("drop_every", 0))
                 pending_frames = []
 
                 def _tone(i: int) -> bytes:
@@ -1436,6 +1472,7 @@ class Service:
                 for idx, pcm in pending_frames:
                     await session.send_down_frame(turn, pcm, seq=idx)
                     await asyncio.sleep(0.02)
+                session._drop_every = 0
                 if session.control is not None:
                     with contextlib.suppress(Exception):
                         await session.control.request("playback.stop",

@@ -69,8 +69,12 @@ def parse(dgram: bytes, mac_len: int = 0) -> Tuple[int, int, bytes, bytes]:
     return kind, turn, dgram[HDR_LEN:end], dgram[end:end + mac_len]
 
 
-def build(kind: int, turn: int, payload: bytes = b"", mac: bytes = b"") -> bytes:
-    return HDR.pack(b"PAV1", kind, 0, 0, turn, len(payload)) + payload + mac
+FLAG_FEC = 0x01     # 头里的 flags 字节：这一包是奇偶块，不是音频
+
+
+def build(kind: int, turn: int, payload: bytes = b"", mac: bytes = b"",
+          flags: int = 0) -> bytes:
+    return HDR.pack(b"PAV1", kind, flags, 0, turn, len(payload)) + payload + mac
 
 
 def sign(secret: bytes, body: bytes, mac_len: int) -> bytes:
