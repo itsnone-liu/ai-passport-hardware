@@ -242,6 +242,8 @@ class AudioLink:
 class Session:
     """One device conversation: control + audio + the current turn."""
 
+    
+
     def __init__(self, service: "Service", device_id: str, session_id: str):
         self.service = service
         self.cfg = service.cfg
@@ -272,6 +274,9 @@ class Session:
         self.probe_bytes = 0
         self.probe_last_turn = 0
         self.probe_end_frames = 0
+        self._pace_t0: Optional[float] = None
+        self._pace_log_t0: Optional[float] = None
+        self._pace_sent = 0.0
         self.probe_end_turn = 0
         self._probe_log_at = 0.0
         self.last_pre_roll_ms = -1
@@ -623,6 +628,9 @@ class Session:
         """
         self.state = STATE_SPEAKING
         self._played_end = asyncio.Event()
+        self._pace_t0 = None
+        self._pace_sent = 0.0
+        self._pace_log_t0 = None
         queue: asyncio.Queue = asyncio.Queue()
         producer_done = object()
 
@@ -649,11 +657,18 @@ class Session:
                 raise first
             if first is producer_done:
                 return
-            await self.control.request("playback.start", self.cfg.request_timeout,
-                                       turn_id=turn_id)
+            reply = await self.control.request("playback.start", self.cfg.request_timeout,
+                                               turn_id=turn_id)
+            log.info("%s playback.start turn=%d -> %s", self.device_id, turn_id, reply)
             await self._write_audio(first, turn_id, m)
             while True:
+                starve_t0 = asyncio.get_running_loop().time()
                 item = await queue.get()
+                starve = asyncio.get_running_loop().time() - starve_t0
+                if starve > 0.2:
+                    log.info("%s downlink starved %.0f ms waiting for TTS "
+                             "(lead %.0f ms)", self.device_id, starve * 1000,
+                             self.cfg.playback_lead * 1000)
                 if item is producer_done or self._cancel.is_set():
                     break
                 if isinstance(item, Exception):
@@ -672,8 +687,22 @@ class Session:
                     await producer
 
     async def _write_audio(self, audio: bytes, turn_id: int, m: TurnMetrics) -> None:
+        """Push 640 B frames, holding a lead of ~400 ms over real time.
+
+        Pacing exactly at real time leaves zero slack for a 166 ms RTT link: one
+        delayed packet and the device underruns, which it can only report as
+        `audio_underrun` long after the listener heard the gap. Sending flat out
+        is worse -- it fills the 1.2 s ring and half the reply is dropped.
+
+        So: fill to LEAD_SECONDS ahead, then hold that lead. The device gets its
+        300 ms prebuffer immediately, jitter is absorbed by the lead, and the
+        ring stays at roughly a third of capacity.
+        """
         step = pav1.FRAME_BYTES_20MS
-        pace = 0.02 / max(0.001, self.cfg.playback_speed)
+        speed = max(0.001, self.cfg.playback_speed)
+        if self._pace_t0 is None:
+            self._pace_t0 = asyncio.get_running_loop().time()
+            self._pace_sent = 0.0
         for off in range(0, len(audio), step):
             if self._cancel.is_set():
                 return
@@ -681,10 +710,30 @@ class Session:
             if len(frame) < step and off + step > len(audio):
                 break               # partial tail is dropped, not padded into the speaker
             await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)
+            if m.downlink_bytes == 0:
+                log.info("%s first PCM frame turn=%d len=%d", self.device_id, turn_id,
+                         len(frame))
             m.downlink_bytes += len(frame)
             if m.tts_first_ms is None:
                 m.tts_first_ms = self.service.now_ms()
-            await asyncio.sleep(pace)
+            self._pace_sent += len(frame) / 32000.0
+            elapsed_virtual = (asyncio.get_running_loop().time() - self._pace_t0) * speed
+            ahead = self._pace_sent - elapsed_virtual
+            lead = self.cfg.playback_lead
+            if self._pace_log_t0 is None:
+                self._pace_log_t0 = asyncio.get_running_loop().time()
+            if asyncio.get_running_loop().time() - self._pace_log_t0 > 1.0:
+                self._pace_log_t0 = asyncio.get_running_loop().time()
+                log.info("%s downlink: sent=%.2fs ahead=%.2fs (lead %.2fs) turn=%d",
+                         self.device_id, self._pace_sent, ahead, lead, turn_id)
+            # Fill at 2x until the lead is established, then pace at real time.
+            # A single burst that dumps 2 s into a 1.2 s ring is not "filling the
+            # buffer", it is overflowing it -- the device drops the excess and
+            # then drains to empty, which it can only report as audio_underrun.
+            if ahead >= lead:
+                await asyncio.sleep(min(0.5, (ahead - lead) / speed))
+            else:
+                await asyncio.sleep(max(0.0, 0.01 / speed))
 
     async def cancel_playback(self) -> None:
         self._cancel.set()
@@ -927,6 +976,9 @@ class Service:
                     "looks_like_undecoded_hex": (len(key) == 64 and all(
                         c in b"0123456789abcdefABCDEF" for c in key)),
                 } for dev, key in self.cfg.devices.items()]}
+            if op == "metrics":
+                session = self.sessions[str(req.get("device", ""))]
+                return {"ok": True, "turns": [m.as_dict() for m in session.metrics[-5:]]}
             if op == "audio":
                 session = self.sessions[str(req.get("device", ""))]
                 return {"ok": True, "device_id": session.device_id,
