@@ -11,6 +11,7 @@
 #include "terminal_link.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <string.h>
 
 static const char *TAG = "usb";
@@ -34,6 +35,7 @@ static void proto_task(void *arg) {
     (void)arg;
     char line[LINE_MAX];
     size_t len = 0;
+    bool discard = false;  // 超长行整行丢弃，直到换行符（见下）
     uint8_t chunk[CHUNK_MAX];
 
     for (;;) {
@@ -42,13 +44,24 @@ static void proto_task(void *arg) {
             const char ch = (char)chunk[i];
             if (ch == '\r') continue;
             if (ch == '\n') {
-                line[len] = '\0';
-                if (len > 0) terminal_link_dispatch(line);
+                if (discard) {
+                    // 静默丢掉半截命令会让主机以为命令生效了；明确告诉它太长。
+                    discard = false;
+                    terminal_link_send("{\"ok\":false,\"err\":\"line too long\"}\n");
+                } else {
+                    line[len] = '\0';
+                    if (len > 0) terminal_link_dispatch(line);
+                }
                 len = 0;
+            } else if (discard) {
+                // 继续丢弃到行尾
             } else if (len < sizeof(line) - 1) {
                 line[len++] = ch;
             } else {
-                len = 0;  // 超长行丢弃，避免粘包后误解析
+                // 旧写法把 len 清零后继续收，行尾那截会被当成一条新命令解析，
+                // 等于把半截 JSON 注入协议。
+                discard = true;
+                len = 0;
             }
         }
     }

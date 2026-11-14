@@ -41,6 +41,7 @@ static bool s_wifi_started;       // esp_wifi_start() 是否已执行
 static SemaphoreHandle_t s_tx_lock;
 static char s_line[LINE_MAX];
 static size_t s_line_len;
+static bool s_rx_discard;  // 正在丢弃一条超长行（见 feed）
 
 static char s_ssid[33];
 static char s_password[65];
@@ -119,26 +120,45 @@ static void tcp_sink(const char *line, size_t len) {
 }
 
 static void drop_link(const char *why) {
-    if (s_sock >= 0) {
-        close(s_sock);
+    // 先摘掉发送资格、再关 fd，且整个过程持锁：否则 tcp_sink 可能正在 send() 一个
+    // 刚被别的任务 close() 掉的描述符（轻则 EBADF，重则把数据写到复用后的新连接上）。
+    int fd = -1;
+    const bool was_connected = s_connected;
+    s_connected = false;
+    if (s_tx_lock && xSemaphoreTake(s_tx_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
+        fd = s_sock;
+        s_sock = -1;
+        xSemaphoreGive(s_tx_lock);
+    } else {
+        fd = s_sock;
         s_sock = -1;
     }
-    if (s_connected) ESP_LOGW(TAG, "连接断开(%s)，%d ms 后重连", why, RETRY_MS);
-    s_connected = false;
+    if (fd >= 0) close(fd);
+    if (was_connected) ESP_LOGW(TAG, "连接断开(%s)，%d ms 后重连", why, RETRY_MS);
 }
 
 // 收到的字节按 '\n' 切行后分发，与 USB 载体行为一致。
 static void feed(const char *data, int len) {
+    // 超长行必须整行丢弃直到换行符：旧写法把 len 清零后继续接收，行尾那截会被当成
+    // 一条新命令去解析，等于把半截命令注入到协议里。
     for (int i = 0; i < len; i++) {
         const char ch = data[i];
         if (ch == '\r') continue;
         if (ch == '\n') {
-            s_line[s_line_len] = '\0';
-            if (s_line_len > 0) terminal_link_dispatch(s_line);
+            if (s_rx_discard) {
+                s_rx_discard = false;
+                terminal_link_send("{\"ok\":false,\"err\":\"line too long\"}\n");
+            } else {
+                s_line[s_line_len] = '\0';
+                if (s_line_len > 0) terminal_link_dispatch(s_line);
+            }
             s_line_len = 0;
+        } else if (s_rx_discard) {
+            // 继续丢弃到行尾
         } else if (s_line_len < sizeof(s_line) - 1) {
             s_line[s_line_len++] = ch;
         } else {
+            s_rx_discard = true;
             s_line_len = 0;
         }
     }
@@ -330,7 +350,7 @@ esp_err_t terminal_net_start(void) {
     return start_err;
 }
 
-esp_err_t terminal_net_apply(const char *ssid, const char *password, const char *host, int port) {
+esp_err_t terminal_net_set(const char *ssid, const char *password, const char *host, int port) {
     if (ssid && *ssid) {
         strncpy(s_ssid, ssid, sizeof s_ssid - 1);
         s_ssid[sizeof s_ssid - 1] = '\0';
@@ -352,14 +372,24 @@ esp_err_t terminal_net_apply(const char *ssid, const char *password, const char 
     if (!s_wifi_started) {
         ESP_LOGI(TAG, "网络参数已保存，将在 Wi-Fi 初始化后生效: ssid=\"%s\" server=%s:%d", s_ssid,
                  s_host, s_port);
-        return ESP_OK;
     }
+    return ESP_OK;
+}
 
+// 拆成 set + reconnect 两步，是为了让回执先走完再断链路：重配网络必然要掐掉当前
+// TCP，如果先断开再回执，发起这条命令的那条连接已经不存在，回执永远到不了对方，
+// 主机只能看到"命令发出、连接断了、不知道成没成"。
+void terminal_net_reconnect(void) {
+    if (!s_wifi_started) return;
     drop_link("reconfigured");
     wifi_apply_sta();
-
     ESP_LOGI(TAG, "网络参数已更新: ssid=\"%s\" server=%s:%d", s_ssid, s_host, s_port);
-    return ESP_OK;
+}
+
+esp_err_t terminal_net_apply(const char *ssid, const char *password, const char *host, int port) {
+    const esp_err_t err = terminal_net_set(ssid, password, host, port);
+    if (err == ESP_OK) terminal_net_reconnect();
+    return err;
 }
 
 // 每次续写都夹住 used，避免 snprintf 返回"本想写多长"导致 used > n、
@@ -417,6 +447,10 @@ void terminal_net_describe(char *buf, size_t n) {
 // 在这里根本不会出现。
 esp_err_t terminal_net_scan(char *buf, size_t n) {
     if (!buf || n < 8) return ESP_ERR_INVALID_ARG;
+
+    // 扫描是唯一的"会主动踢掉当前关联"的操作，两个并发扫描会把状态机搅乱，
+    // 也会让后一个的收尾去重连一个已经不该重连的连接。直接回绝。
+    if (s_scanning) return ESP_ERR_INVALID_STATE;
 
     wifi_scan_config_t sc;
     memset(&sc, 0, sizeof sc);

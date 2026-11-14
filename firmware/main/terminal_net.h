@@ -26,6 +26,13 @@ bool terminal_net_ip_ready(void);
 // 更新并持久化网络参数，然后断开重连。任一参数传 NULL 表示保持原值；port <= 0 同理。
 esp_err_t terminal_net_apply(const char *ssid, const char *password, const char *host, int port);
 
+// 只更新并持久化参数，不动现有链路；配合 terminal_net_reconnect() 使用。
+// 这样调用方可以先发回执、再断链，避免回执排在断开之后永远送不出去。
+esp_err_t terminal_net_set(const char *ssid, const char *password, const char *host, int port);
+
+// 按当前参数断开并重新连接（Wi-Fi 未初始化时为空操作）。
+void terminal_net_reconnect(void);
+
 // 把当前配置写成 JSON 片段（不含密码），形如 "ssid":"..","host":"..","port":8080
 void terminal_net_describe(char *buf, size_t n);
 

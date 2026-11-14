@@ -112,11 +112,13 @@ static void apply_brightness(int value) {
     }
 }
 
-static void apply_text(const char *text) {
-    if (bsp_lvgl_lock(200)) {
-        terminal_ui_set_message(text);
-        bsp_lvgl_unlock();
-    }
+// 返回 false 表示没写进屏幕（锁超时）。调用方必须据此回 error，而不是回 ok——
+// "显示成功"和"根本没显示"在主机侧无法区分，后续自动化会照着假象继续跑。
+static bool apply_text(const char *text) {
+    if (!bsp_lvgl_lock(200)) return false;
+    terminal_ui_set_message(text);
+    bsp_lvgl_unlock();
+    return true;
 }
 
 static int int_field(const cJSON *root, const char *name, int dflt) {
@@ -153,8 +155,11 @@ void terminal_link_dispatch(char *line) {
         reply_status(id);
     } else if (strcmp(c, "show_text") == 0) {
         const cJSON *t = cJSON_GetObjectItemCaseSensitive(root, "text");
-        apply_text(cJSON_IsString(t) ? t->valuestring : "");
-        send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"show_text\"}\n", id);
+        if (apply_text(cJSON_IsString(t) ? t->valuestring : "")) {
+            send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"show_text\"}\n", id);
+        } else {
+            send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"show_text\",\"err\":\"display busy\"}\n", id);
+        }
     } else if (strcmp(c, "set_volume") == 0) {
         apply_volume(int_field(root, "value", terminal_ui_volume()));
         send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"set_volume\",\"volume\":%d}\n", id,
@@ -171,13 +176,16 @@ void terminal_link_dispatch(char *line) {
         const cJSON *pw = cJSON_GetObjectItemCaseSensitive(root, "password");
         const cJSON *host = cJSON_GetObjectItemCaseSensitive(root, "host");
         const cJSON *port = cJSON_GetObjectItemCaseSensitive(root, "port");
-        const esp_err_t err = terminal_net_apply(
+        // 先落参数、先回执，最后才断链路重连：重配网络必然掐掉当前 TCP，回执如果排在
+        // 断开之后，发起方永远收不到"到底成没成"。
+        const esp_err_t err = terminal_net_set(
             cJSON_IsString(ssid) ? ssid->valuestring : NULL,
             cJSON_IsString(pw) ? pw->valuestring : NULL,
             cJSON_IsString(host) ? host->valuestring : NULL,
             cJSON_IsNumber(port) ? port->valueint : 0);
         if (err == ESP_OK) {
             send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"set_net\"}\n", id);
+            terminal_net_reconnect();  // 回执已经发出去了，这时断链才安全
         } else {
             send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"set_net\",\"err\":\"apply failed\"}\n", id);
         }
