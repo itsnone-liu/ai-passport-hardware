@@ -1356,13 +1356,31 @@ class Service:
                                                   turn_id=turn)
                 import math
                 import struct as _struct
-                for i in range(n):
+                shuffle = bool(req.get("shuffle", False))
+                pending_frames = []
+
+                def _tone(i: int) -> bytes:
                     samples = pav1.FRAME_BYTES_20MS // 2
                     base = i * samples
                     pcm = b"".join(
                         _struct.pack("<h", int(6000 * math.sin(
                             2 * math.pi * hz * (base + k) / 16000)))
                         for k in range(samples))
+                    return pcm
+
+                for i in range(n):
+                    pending_frames.append(_tone(i))
+                    # shuffle: hold two frames and send them reversed, which is
+                    # what a real path does occasionally. Without a reorder
+                    # window on the device this lands in the playback ring and
+                    # swaps two adjacent 20 ms blocks.
+                    if shuffle and len(pending_frames) < 2:
+                        continue
+                    for pcm in reversed(pending_frames):
+                        await session.send_down_frame(turn, pcm)
+                        await asyncio.sleep(0.02)
+                    pending_frames.clear()
+                for pcm in pending_frames:
                     await session.send_down_frame(turn, pcm)
                     await asyncio.sleep(0.02)
                 if session.control is not None:
