@@ -84,3 +84,48 @@ PCM 上行 31.2 KB/s、下行 64 KB/s 都不可能；ADPCM 8.4 KB/s，加 FEC 11
 4. **下行丢包率随时段波动**（0%~10%），FEC 只保证"同组丢一块能救"，
    丢两块记 `norecover` 如实上报。
 5. `play_mismatch` 偶发 1–4：停止时尾部未播完的块被冲掉，属设计行为，未逐块对账。
+
+## §4 真人语音端到端（首次通过）
+
+2026-11-15 07:26，用户按住 OK 键说了一句"今天天气怎么样？"后松手。
+
+| 环节 | 实测 |
+|---|---|
+| 按键 → 起采 | `key press (state=idle)` → `capture.started turn=1 pre_roll_ms=140` |
+| 采集 | `frames=157 dropped=0 rms=1616 peak=32768`（3.14 s） |
+| 上行解码 | `blocks=157 lost=0 bad=0 (3.14 s decoded, rms=1575)` |
+| UDP 收齐 | `blocks=157 reordered=0 dups=0 gaps=0 pending=0 tail=0` |
+| **ASR** | **`turn 1 asr done in 3218 ms text='今天天气怎么样？'`** |
+| 回放 | `playback.start ok`、`played=114`、`underruns=0`、`overflows=0` |
+
+**这是第一次真实人声走完全链路**：麦克风 → ES8311 → ADPCM → UDP → ASR →
+TTS → 回放出声。此前所有采集都是环境声（`rms` 25–26），ASR 返回空字符串。
+
+时间线（松手 07:26:37.939 起算）：
+
+| 时刻 | 事件 | 相对松手 |
+|---|---|---|
+| 07:26:41.451 | ASR 完成 | +3.51 s |
+| 07:26:42.632 | 第一块 TTS 音频（11744 B） | +4.69 s |
+| 07:26:42.787 | `playback.start` ok | +4.85 s |
+
+### 这次暴露的两个真问题（不藏）
+
+1. **Brain 是 mock**：启动行写的是 `brain=mock`。ASR 和 TTS 是真的（bailian），
+   中间那句"回答"还没接真 LLM。所以设备能听会说，但说的话不是 LLM 生成的。
+2. **回放没走 UDP**：下行日志是 `first PCM frame turn=1 len=640` +
+   `downlink done: 72960 bytes`——这是 **TCP/PCM** 路径（640 B/帧），
+   不是 §3 做的 UDP/ADPCM（164 B/块）。`udp_down` 在整个 turn 里没有增长。
+   也就是说：**上行已经全走 UDP，下行在真实回放路径上还在走 TCP**；
+   台架 `push_udp` 走 UDP 是因为它直接调 `send_down_frame`，
+   而 TTS 回放走的是 `_write_audio` 那条 PCM 通道。
+
+   TCP 下行意味着丢包会卡住整条流（实测 8.4→64 KB/s 需求超过 18.7 KB/s
+   上限，只能靠 TCP 的流控挤，这正是原本要做 UDP 的理由）。这是下一步。
+
+### 顺带确认：按键语义
+
+`terminal_main.c` 里是"按住说、松手停"：`OK+PRESS → capture_arm()`、
+`OK+RELEASE → capture_request_end()`。旧代码只认 CLICK，人手按住必然超过
+500 ms 被判成 LONG 去调亮度，采集一次都没启动过——这就是之前真人测试
+一直失败的真因，已修。
