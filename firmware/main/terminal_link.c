@@ -6,11 +6,14 @@
 #include "bsp_display.h"
 #include "cJSON.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "terminal_net.h"
+#include "terminal_audio.h"
 #include "terminal_ui.h"
 
 #include <stdarg.h>
@@ -87,9 +90,17 @@ static void reply_status(int id) {
     const int soc = bsp_battery_soc();
     const int mv = bsp_battery_mv();
     const int64_t up = (esp_timer_get_time() - s_boot_us) / 1000000;
+    // 堆的三个数决定了"一条话最多能缓冲多久"，也是判断'是不是内存不够'的唯一现场依据，
+    // 所以放进 status 而不是另开命令。
+    const unsigned heap_now = (unsigned)esp_get_free_heap_size();
+    const unsigned heap_min = (unsigned)esp_get_minimum_free_heap_size();
+    const unsigned heap_blk =
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
     send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"status\",\"battery\":%d,\"mv\":%d,"
-             "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld}\n",
-             id, soc, mv, terminal_ui_volume(), terminal_ui_brightness(), (long long)up);
+             "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld,"
+             "\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u}\n",
+             id, soc, mv, terminal_ui_volume(), terminal_ui_brightness(), (long long)up, heap_now,
+             heap_min, heap_blk);
 }
 
 static void apply_volume(int value) {
@@ -202,6 +213,16 @@ void terminal_link_dispatch(char *line) {
             send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"scan\",%s}\n", id, s_scan);
         } else {
             send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"scan\",\"err\":\"%s\"}\n", id,
+                     esp_err_to_name(err));
+        }
+    } else if (strcmp(c, "audio_selftest") == 0) {
+        // 设备侧音频自测：录一段再原样回放，用来验证 codec 采播与帧时序。
+        const int ms = int_field(root, "ms", 2000);
+        const esp_err_t err = terminal_audio_selftest_start(ms);
+        if (err == ESP_OK) {
+            send_fmt("{\"id\":%d,\"ok\":true,\"cmd\":\"audio_selftest\",\"ms\":%d}\n", id, ms);
+        } else {
+            send_fmt("{\"id\":%d,\"ok\":false,\"cmd\":\"audio_selftest\",\"err\":\"%s\"}\n", id,
                      esp_err_to_name(err));
         }
     } else {

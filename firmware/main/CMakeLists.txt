@@ -4,6 +4,7 @@ idf_component_register(
          "terminal_link.c"
          "terminal_proto.c"
          "terminal_net.c"
+         "terminal_audio.c"
     INCLUDE_DIRS "."
     REQUIRES bsp
              esp_driver_usb_serial_jtag
