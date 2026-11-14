@@ -511,8 +511,10 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         const char *host = str_field(root, "host", terminal_net_host());
         const int port = int_field(root, "port", terminal_net_port());
         const int tries = int_field(root, "tries", 6);
+        // 默认 3 s 上限：被过滤的地址不会回 SYN-ACK，没有上限就会把控制通道占住。
+        const int tmo = int_field(root, "timeout_ms", 3000);
         rtt_stat_t st = {0};
-        const esp_err_t err = terminal_net_rtt(host, port, tries, &st);
+        const esp_err_t err = terminal_net_rtt(host, port, tries, tmo, &st);
         if (err == ESP_OK) {
             reply_fmt(reply,
                       "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.rtt\",\"host\":\"%s\",\"port\":%d,"

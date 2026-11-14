@@ -828,9 +828,10 @@ esp_err_t terminal_net_accept_test(int port) {
 // ---- 路径质量测量：n 次 TCP 连接（SYN→SYN-ACK 完成即一个 RTT）----
 // 连接失败也算一次样本：SYN 丢了就是最直接的丢包证据。
 // 同步返回统计：调用方一次拿到 min/avg/max 与失败数，不依赖日志或事件流。
-esp_err_t terminal_net_rtt(const char *host, int port, int tries, rtt_stat_t *out) {
+esp_err_t terminal_net_rtt(const char *host, int port, int tries, int timeout_ms, rtt_stat_t *out) {
     if (!host || port <= 0 || tries <= 0) return ESP_ERR_INVALID_ARG;
     if (tries > 10) tries = 10;
+    if (timeout_ms < 200) timeout_ms = 200;
     struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -845,8 +846,27 @@ esp_err_t terminal_net_rtt(const char *host, int port, int tries, rtt_stat_t *ou
             fail++;
             continue;
         }
+        // 非阻塞 connect + select 限时：被过滤的地址（比如某些境外 IP）会一直不回
+        // SYN-ACK，用默认超时就会把控制通道占住几十秒，探测命令不该有这种副作用。
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
         const int64_t t0 = esp_timer_get_time();
-        const int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+        int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            fd_set wf;
+            FD_ZERO(&wf);
+            FD_SET(fd, &wf);
+            struct timeval tv = {.tv_sec = timeout_ms / 1000,
+                                 .tv_usec = (timeout_ms % 1000) * 1000};
+            rc = select(fd + 1, NULL, &wf, NULL, &tv);
+            if (rc > 0) {
+                int so_err = 0;
+                socklen_t elen = sizeof so_err;
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &elen);
+                rc = (so_err == 0) ? 0 : -1;
+            } else {
+                rc = -1;  // 超时
+            }
+        }
         const int ms = (int)((esp_timer_get_time() - t0) / 1000);
         close(fd);
         if (rc == 0) {

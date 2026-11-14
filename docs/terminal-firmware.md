@@ -93,6 +93,32 @@ A `ready` event is emitted once per transport as it comes up, so a host can tell
 device is on USB, on the network, or both. Hosts must ignore serial lines that do not start
 with `{` — ESP-IDF logs share the stream.
 
+## Counter semantics: per-turn or since boot
+
+`get_audio` mixes both kinds, and that cost a full debugging round between the two agents: a
+conservation check compared a **per-turn** `played` against a **cumulative** `rx`, got
+`played +0` while `rx +114`, and concluded the implementation was losing frames. It was not.
+The rule below is the fix, so nobody has to infer the convention from behaviour.
+
+| Field | Scope | Reset at |
+|---|---|---|
+| `audio_rx_frames`, `audio_rx_end`, `audio_tx_frames` | since boot | restart |
+| `push_ok`, `rej_idle`, `rej_turn`, `rej_size`, `play_mismatch` | since boot | restart |
+| `played_total` | since boot | restart |
+| `played`, `play_overflows`, `play_underruns` | **per turn** | `playback.start` |
+| `frames`, `dropped`, `rms`, `peak` (capture) | **per turn** | `capture.start` |
+| `turns`, `read_fail`, `overflows` (capture) | since boot | restart |
+
+Two consequences worth stating outright:
+
+- A conservation check must be written on **one** axis. `push_ok + rej_idle + rej_turn +
+  rej_size` equals the `audio_rx_frames` delta; `played_total` delta equals what actually
+  reached I2S. Comparing across axes always "fails".
+- Any counter that resets is also a restart detector. If `played` drops while `boot` is
+  unchanged, that is a real bug; if `boot` moved, it was a restart and the counters are
+  simply new. `boot`/`reset`/`prev_heap_min` in `get_status` exist so this is a field
+  comparison rather than an argument.
+
 ## Network configuration
 
 Compile-time defaults live in `menuconfig → dsh terminal` (`TERMINAL_WIFI_SSID`,

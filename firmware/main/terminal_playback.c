@@ -46,6 +46,10 @@ static uint32_t s_underruns;
 static uint32_t s_mismatch;
 // 帧为什么没进环：三种完全不同的原因，各自计数（混成一个数就只能靠猜）。
 static uint32_t s_rej_idle, s_rej_turn, s_rej_size, s_push_ok;
+// 上面这些是 per-turn（playback.start 归零）。校验守恒时若拿 per-turn 的 played
+// 去差分累计的 rx，每轮都会得出"played+0 而 rx+114"这种看起来不可能的结论。
+// 所以另记一个自启动累计值，让差分口径唯一。
+static uint32_t s_played_total;
 static char s_state_txt[16] = "idle";
 
 static void emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -175,7 +179,10 @@ static void playback_task(void *arg) {
 
         if (got) {
             s_last_data_us = esp_timer_get_time();
-            if (bsp_audio_write(frame, FRAME_BYTES) == ESP_OK) s_played_frames++;
+            if (bsp_audio_write(frame, FRAME_BYTES) == ESP_OK) {
+                s_played_frames++;
+                s_played_total++;
+            }
             s_next_frame_us += 20000;  // 20 ms/帧，与 §4 的帧长严格对应
             const int64_t after = esp_timer_get_time();
             if (s_next_frame_us < after) s_next_frame_us = after;  // 落后就追上，不补播
@@ -283,12 +290,13 @@ void terminal_playback_describe(char *buf, size_t n) {
     xSemaphoreGive(s_mu);
     snprintf(buf, n,
              "\"play_state\":\"%s\",\"play_turn\":%u,\"ring_frames\":%d,\"ring_ms\":%d,"
-             "\"played\":%u,\"play_overflows\":%u,\"play_underruns\":%u,\"play_mismatch\":%u,"
+             "\"played\":%u,\"played_total\":%u,"
+             "\"play_overflows\":%u,\"play_underruns\":%u,\"play_mismatch\":%u,"
              "\"push_ok\":%u,\"rej_idle\":%u,\"rej_turn\":%u,\"rej_size\":%u",
              s_state_txt, (unsigned)(s_state == PB_IDLE ? 0 : s_turn), have, have * 20,
-             (unsigned)s_played_frames, (unsigned)s_overflows, (unsigned)s_underruns,
-             (unsigned)s_mismatch, (unsigned)s_push_ok, (unsigned)s_rej_idle, (unsigned)s_rej_turn,
-             (unsigned)s_rej_size);
+             (unsigned)s_played_frames, (unsigned)s_played_total, (unsigned)s_overflows,
+             (unsigned)s_underruns, (unsigned)s_mismatch, (unsigned)s_push_ok,
+             (unsigned)s_rej_idle, (unsigned)s_rej_turn, (unsigned)s_rej_size);
 }
 
 // ---- 厂商自测：把正弦按服务端的节奏推进播放环 ----

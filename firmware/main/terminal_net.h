@@ -55,4 +55,4 @@ typedef struct {
 
 // 同步测量到 host:port 的 TCP 连接 RTT（每次连接 = 一个 RTT），失败也计入。
 // 阻塞调用方，最多约 tries × (RTT + 200 ms)。
-esp_err_t terminal_net_rtt(const char *host, int port, int tries, rtt_stat_t *out);
+esp_err_t terminal_net_rtt(const char *host, int port, int tries, int timeout_ms, rtt_stat_t *out);
