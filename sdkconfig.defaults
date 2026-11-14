@@ -1,0 +1,56 @@
+# --- 閻╊喗鐖ｉ懞顖滃 ---
+CONFIG_IDF_TARGET="esp32c3"
+# 濞?ESP32-C3 閺?PSRAM,閺佸懍绗夌拋?CONFIG_SPIRAM閵?
+
+# --- Flash ---
+# FoloToy AI Passport 瑜版挸澧犳禍褍鎼?閸ヨ桨娆㈤崺铏瑰殠娴ｈ法鏁?8MB Flash閵?
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# 閸ュ搫鐣?8MB 闂€婊冨剼婢惰揪绱濋崗鎶芥４ detect閿涘奔绌舵禍?idf.py merge-bin閵?
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=n
+# 姒涙顓诲Ο鈩冩緲閸欘亙绻氶悾?NVS閵嗕赋HY data 閸滃苯宕伴悽銊ュ⒖娴ｆ瑧鈹栭梻瀵告畱 factory app閿涙稓鏁ら幋宄板讲閹稿娓舵穱顔芥暭閵?
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# --- 閹貉冨煑閸?USB-Serial-JTAG(C3 閸樼喓鏁?USB,GPIO18/19)---
+# 娑撳秶鏁?UART0:閸忓爼绮拋?TX=GPIO21 娑撳孩婀伴弶鑳剹閸忓绱╅懘姘暱缁愪降鈧?
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- LVGL ---
+CONFIG_LV_COLOR_DEPTH_16=y
+# 20 ms display refresh period targets up to 50 FPS when rendering and SPI
+# transfer complete within the same budget.
+CONFIG_LV_DEF_REFR_PERIOD=20
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+# LVGL 閸掑棝鍘ら崳顭掔窗姒涙顓婚弨鍦暏缁崵绮洪崼鍡欐畱閺嶅洤鍣?malloc/realloc/free閵?
+# 閸愬懐鐤?24KB 闂堟瑦鈧焦鐫滈崷銊ヮ槻閺夊倸娓剧憴?閽傛瑧澧楃紒妯哄煑閺冩湹绱伴懓妤€鏁栭敍瀹璿_malloc 鏉╂柨娲?NULL 閸?LVGL 閺傤叀鈻堝璇叉儕閻滎垽绱?
+# 妤楁寧顒?IDLE 鐟欙箑褰?TWDT 閸愯鐫嗛敍鍫㈡埂閺堝搫鍑℃径宥囧箛閿涙艾娓剧憴鎺曟寢閻楀牐銆冮崚鍡涘帳婢惰精瑙﹂敍澶堚偓鍌滈兇缂佺喎鐖㈢痪?130KB 閸欘垳鏁ら敍?
+# 娑撳秳绱伴崡鐘垫暏妫版繂顦婚棃娆愨偓浣稿隘閿涙稐绮涢崣顖涘瘻闂団偓閺€鐟版礀閸愬懐鐤嗗Ч鐘茶嫙鐠?CONFIG_LV_MEM_SIZE_KILOBYTES閵?
+CONFIG_LV_USE_CLIB_MALLOC=y
+
+# --- 缁崵绮?---
+CONFIG_FREERTOS_HZ=1000
+
+# --- 閽冩繄澧?---
+# 閻︼妇绮撶粩顖欑瑝娴ｈ法鏁?BLE閿涙艾鍙ч幒澶婂讲閻?flash閿涘苯鑻熺拋?Wi-Fi 閻欘剙宕扮亸鍕暥閵嗕胶娓烽幒澶婂彙鐎涙ê绱戦柨鈧妴?
+CONFIG_BT_ENABLED=n
+
+# --- Wi-Fi STA閿涘湣3 缂冩垹绮舵潪鎴掔秼閿涘矁顔曟径鍥﹀瘜閸斻劍瀚ч崣閿嬫箛閸斺€虫珤閿?--
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+CONFIG_ESP_WIFI_NVS_ENABLED=y
+
+# --- dsh 缂佸牏顏崣鍌涙殶閿涘牐顫?main/Kconfig.projbuild閿?--
+CONFIG_TERMINAL_WIFI_SSID="your-ssid"
+CONFIG_TERMINAL_WIFI_PASSWORD="changeme"
+CONFIG_TERMINAL_SERVER_HOST="host.emu.internal"
+CONFIG_TERMINAL_SERVER_PORT=8080
+
+# 娑撳顢戦棅鎶筋暥閿?05 ms RTT 鑴?31.2 KB/s = 6.4 KB 閻ㄥ嫬鐢€硅棄娆㈡潻鐔盒濋敍灞藉斧閺夈儳娈?5760 B 缁愭褰涢悧鈺冩倞娑撳﹨绐囨稉宥嗗姬鐎圭偞妞傞妴?CONFIG_LWIP_TCP_WND_DEFAULT=16384
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=16384
+
+# 窄带 WAN（205 ms RTT）上丢一个段就意味着拥塞窗口回退：
+# 接收端会 SACK、乱序段多留一些，别让发送方从 1 个 MSS 重新长起来。
+CONFIG_LWIP_TCP_SACK_OUT=y
+CONFIG_LWIP_TCP_OOSEQ_MAX_PBUFS=16

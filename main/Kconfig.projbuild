@@ -1,0 +1,30 @@
+menu "dsh terminal"
+
+    config TERMINAL_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "dsh-lab"
+        help
+            STA 模式要连接的热点名。初始凭据走编译期常量；后续可改为 NVS 保存并
+            由 USB 控制通道下发，避免换网就要重刷固件。
+
+    config TERMINAL_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "dsh-lab-pass"
+        help
+            留空表示开放网络。
+
+    config TERMINAL_SERVER_HOST
+        string "Server host"
+        default "host.emu.internal"
+        help
+            设备主动拨号的服务器地址。模拟器里 host.emu.internal 指向虚拟 LAN，
+            由 `passportsim net_http --op bridge` 桥接到主机端口；真机部署时改成
+            Ubuntu 服务器的地址，例如 192.168.1.10。
+
+    config TERMINAL_SERVER_PORT
+        int "Server port"
+        default 8080
+        help
+            dsh 侧监听的 TCP 端口，一条连接上跑"一行一条 JSON"的协议。
+
+endmenu
