@@ -598,3 +598,24 @@ class TestAudioChannelAccept(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(data)
         self.assertEqual("bad_magic", pav1.Framer().feed(data)[0].json()["err"])
         writer.close()
+
+
+class TestCaptureSignals(ServiceCase):
+    """Fields the firmware now sends, and the retry it asks the server for."""
+
+    async def test_capture_started_and_ended_carry_real_numbers(self):
+        await self.dev.converse(UPLOAD)
+        await asyncio.sleep(0.05)
+        session = self.svc.session_of(DEVICE)
+        self.assertEqual(0, session.last_pre_roll_ms, "no key press -> 0, not a nominal 300")
+        self.assertGreater(session.last_capture_frames, 0)
+        self.assertEqual(0, session.last_capture_dropped)
+
+    async def test_busy_on_capture_start_is_retried(self):
+        """ready arrives before the audio handshake; busy must not be fatal."""
+        self.dev.busy_once = True
+        result = await self.dev.converse(UPLOAD)
+        self.assertGreater(len(result["audio"]), 0,
+                           "a single busy must not abandon the turn")
+        session = self.svc.session_of(DEVICE)
+        self.assertEqual(1, len(session.metrics))

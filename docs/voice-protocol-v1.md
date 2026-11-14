@@ -252,8 +252,8 @@ while (len >= 16) {
 |---|---|
 | `ready` `{link:"usb"\|"net"}` | 每条载体各自一次，**必须在 `auth` 成功之后才发** |
 | `key` `{btn,ev}` | 原样保留；`ev` ∈ press/click/double/long/release |
-| `capture.started` `{turn_id}` | pre-roll 已补发，开始送实时帧 |
-| `capture.ended` `{turn_id,reason}` | `released`/`cancelled`/`max_duration`/`error` |
+| `capture.started` `{turn_id, pre_roll_ms}` | pre-roll 已补发，开始送实时帧；`pre_roll_ms` 是**实测值**（0 或 300），由设备按键与否决定 |
+| `capture.ended` `{turn_id, reason, frames, dropped}` | `reason` ∈ `released`/`cancelled`/`max_duration`/`error`；`frames`/`dropped` 为实测计数 |
 | `playback.started` `{turn_id}` | I2S 已出第一块声音 |
 | `playback.ended` `{turn_id,reason}` | `completed`/`cancelled`/`underrun`/`error` |
 | `error` `{turn_id?,code,detail?}` | 结构化，见 §6.5 |
@@ -318,6 +318,16 @@ while (len >= 16) {
 ```
 
 - 同一设备同一时刻**只有一个活动 turn**；再来一轮 → `busy`。
+
+**`capture.start` 的 `busy` 是可重试的**（W2-4 真机约定）：`ready` 在控制认证成功时就发，
+而音频通道握手稍后才完成，所以"收到 `ready` 就发 `capture.start`"必然落在这个窗口里。
+设备此时回 `busy`（可重试），服务端应重试 3 次、间隔 300 ms；`not_supported` 表示设备做不到。
+两者**不得混用**——把可重试的情况报成能力缺失，会让服务端放弃一台本来正常的设备。
+
+**轮次结束只有四个理由**：`released`（松手 / 服务端 stop）、`max_duration`（30 s，对齐服务端
+缓冲上限）、`error`（连续 500 ms 发不出去 → `audio_overflow`）、`cancelled`。
+**单帧丢弃只计数、不终止轮次**——对话不该因为丢一帧就断。
+
 - 状态只由服务端 `state.set` + 设备本地事件共同驱动；设备不得自行发明状态（避免 UI 与服务端认知分叉）。
 - `scan` / `set_net` 执行期间禁止开新语音轮（`busy`），避免断 Wi-Fi 打断会话。
 
@@ -382,14 +392,16 @@ while (len >= 16) {
 设备侧内存账（供 Windows 侧核对，非约束）。**注**：早期稿写的"可用堆 ~170 KB"是估算，真机
 （Wi-Fi + LVGL + UI 全起、运行 21 s）实测为 `heap=118624 / heap_min=113236 / heap_block=106496`。
 55 KB 预算仍成立（最大单块 38,400 B ≪ 106,496 B），但余量是 ~63 KB 而不是 ~115 KB。
-这三个数已做进固件 `get_status`，联调时服务端**直接读**，不要估算：
+这三个数已做进固件 `get_status`，联调时服务端**直接读**，不要估算。
+另有一条实现约定（2026-11-14 W2-4 真机）：**播放环形缓冲改用静态分配**，不从堆里抢——
+定长缓冲没有理由和 lwip 争碎片，`heap_min` 在长采集期间已经掉到 55 KB 量级。
 
 ```
 pre-roll 环   9,600 B
 播放环       38,400 B
 解析/发送缓冲 ~4 KB
 I2S DMA      4 × 640 B ≈ 2.6 KB
-合计         ≈ 55 KB   （实测空闲 118,624 B / 最大连续块 106,496 B 时余量 ~63 KB；须实测高水位）
+合计         ≈ 55 KB   （稳态空闲约 97–118 KB；3.3 s 采集期间 heap_min 实测掉到 55,484 B、最大块 77,824 B）
 ```
 
 ---

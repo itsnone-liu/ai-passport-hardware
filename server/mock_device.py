@@ -65,6 +65,9 @@ class MockPassport:
         self._seq = 0
         self.received_end = False
         self.server_audio_nonce = ""
+        self.busy_once = False
+        self.pre_roll_ms = 0
+        self.captured_frames = 0
         self.audio_device_nonce = ""
         self.audio_authed = False
 
@@ -183,7 +186,8 @@ class MockPassport:
 
     async def _reply(self, msg: dict, **fields) -> None:
         cmd = fields.pop("cmd", msg.get("cmd"))
-        out = {"id": msg.get("id", 0), "ok": True, "cmd": cmd}
+        ok = fields.pop("ok", True)
+        out = {"id": msg.get("id", 0), "ok": ok, "cmd": cmd}
         out.update(fields)
         assert self.control_writer is not None
         self.control_writer.write((json.dumps(out, separators=(",", ":")) + "\n").encode())
@@ -192,16 +196,23 @@ class MockPassport:
     async def _on_command(self, msg: dict) -> None:
         cmd = msg.get("cmd")
         if cmd == "capture.start":
+            if self.busy_once:
+                self.busy_once = False
+                await self._reply(msg, cmd="capture.start", **{"ok": False, "err": "busy"})
+                return
             self.turn_id = int(msg.get("turn_id", 0))
             self.state = "listening"
             self.received_end = False
             await self._reply(msg, turn_id=self.turn_id)
+            await self._emit({"event": "capture.started", "turn_id": self.turn_id,
+                              "pre_roll_ms": self.pre_roll_ms})
             self._listening.set()
         elif cmd == "capture.stop":
             await self._reply(msg, turn_id=self.turn_id)
             await self._send_end()
             await self._emit({"event": "capture.ended", "turn_id": self.turn_id,
-                              "reason": "released"})
+                              "reason": "released", "frames": self.captured_frames,
+                              "dropped": 0})
         elif cmd == "playback.start":
             self.turn_id = int(msg.get("turn_id", 0))
             self.state = "speaking"
@@ -315,6 +326,7 @@ class MockPassport:
             frame = pcm[off:off + self.audio_frame_bytes]
             if len(frame) < self.audio_frame_bytes:
                 frame += b"\x00" * (self.audio_frame_bytes - len(frame))
+            self.captured_frames += 1
             self.audio_writer.write(pav1.encode_frame(pav1.KIND_PCM, self.turn_id, frame))
             if pace:
                 await self.audio_writer.drain()

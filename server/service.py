@@ -271,7 +271,12 @@ class Session:
         self.probe_frames = 0
         self.probe_bytes = 0
         self.probe_last_turn = 0
+        self.probe_end_frames = 0
+        self.probe_end_turn = 0
         self._probe_log_at = 0.0
+        self.last_pre_roll_ms = -1
+        self.last_capture_frames = -1
+        self.last_capture_dropped = -1
         self._last_end_reason = ""
         self._current_prefix = b""
 
@@ -383,8 +388,22 @@ class Session:
         ev = msg.get("event")
         if ev == "key":
             await self.on_key(str(msg.get("btn", "")), str(msg.get("ev", "")))
+        elif ev == "capture.started":
+            # pre_roll_ms is the *measured* pre-roll, 0 when there was nothing to
+            # replay (straight capture.start with no key press). Reporting a
+            # nominal 300 would make the server expect audio that never existed.
+            self.last_pre_roll_ms = int(msg.get("pre_roll_ms", -1))
+            log.info("%s capture.started turn=%s pre_roll_ms=%s", self.device_id,
+                     msg.get("turn_id"), self.last_pre_roll_ms)
         elif ev == "capture.ended":
             self._last_capture_reason = str(msg.get("reason", ""))
+            if "frames" in msg:
+                self.last_capture_frames = int(msg.get("frames", -1))
+            if "dropped" in msg:
+                self.last_capture_dropped = int(msg.get("dropped", -1))
+            log.info("%s capture.ended turn=%s reason=%s frames=%s dropped=%s",
+                     self.device_id, msg.get("turn_id"), self._last_capture_reason,
+                     self.last_capture_frames, self.last_capture_dropped)
             self._capture_ended.set()
         elif ev == "playback.ended":
             self._last_end_reason = str(msg.get("reason", ""))
@@ -466,6 +485,12 @@ class Session:
 
     async def on_uplink_end(self, turn_id: int) -> None:
         if self.active_turn != turn_id or self.state != STATE_LISTENING:
+            if self.cfg.dev_audio_probe:
+                # Firmware drove capture.start itself (USB) so this link never
+                # owned the turn -- still prove the END frame arrived.
+                self.probe_end_frames += 1
+                self.probe_end_turn = turn_id
+                log.info("%s uplink probe: END seen for turn %d", self.device_id, turn_id)
             return
         self._capture_ended.set()
 
@@ -492,9 +517,35 @@ class Session:
         self._capture_dropped = 0
         self._capture_ended = asyncio.Event()
         self._cancel = asyncio.Event()
-        await self.control.request("capture.start", self.cfg.request_timeout,
-                                   turn_id=self.active_turn)
+        reply = await self._capture_start(self.active_turn)
+        if not reply.get("ok"):
+            # busy == the audio channel is still dialling: retry is right.
+            # Anything else (not_supported, error) means retrying is pointless.
+            await self.report_error(str(reply.get("err", "capture_start_failed")),
+                                    f"turn {self.active_turn}")
+            self.state = STATE_IDLE
+            self.active_turn = None
+            return
         self._capture_task = asyncio.create_task(self._capture_watchdog(self.active_turn))
+
+    async def _capture_start(self, turn_id: int, attempts: int = 4,
+                             delay: float = 0.3) -> Dict[str, Any]:
+        """capture.start with the retry the contract asks for on `busy`.
+
+        `ready` is emitted when control auth succeeds, but the audio channel
+        finishes its own handshake later, so a capture.start that lands in that
+        window is answered `busy`. Treating that as fatal would abandon a
+        perfectly good device at the one moment it was about to become ready.
+        """
+        for attempt in range(attempts):
+            reply = await self.control.request("capture.start", self.cfg.request_timeout,
+                                               turn_id=turn_id)
+            if reply.get("ok") or reply.get("err") != "busy":
+                return reply
+            log.info("%s capture.start busy (attempt %d/%d), retrying in %.0f ms",
+                     self.device_id, attempt + 1, attempts, delay * 1000)
+            await asyncio.sleep(delay)
+        return {"ok": False, "err": "busy"}
 
     async def _capture_watchdog(self, turn_id: int) -> None:
         try:
@@ -832,6 +883,11 @@ class Service:
                         "rx_bytes": session.probe_bytes,
                         "rx_seconds": round(session.probe_bytes / 32000, 2),
                         "last_turn_seen": session.probe_last_turn,
+                        "rx_end_frames": session.probe_end_frames,
+                        "last_end_turn": session.probe_end_turn,
+                        "last_pre_roll_ms": session.last_pre_roll_ms,
+                        "last_capture_frames": session.last_capture_frames,
+                        "last_capture_dropped": session.last_capture_dropped,
                         "turns_done": len(session.metrics)}
             if op == "show":
                 session = self.sessions[str(req.get("device", ""))]
