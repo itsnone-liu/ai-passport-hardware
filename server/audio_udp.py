@@ -41,7 +41,18 @@ class BadDatagram(ValueError):
     """数据报不合法。调用方只计数，不要抛到事件循环里。"""
 
 
-def parse(dgram: bytes) -> Tuple[int, int, bytes]:
+MAC_HELLO = 8
+MAC_AUDIO = 4
+
+def mac_len_for(kind: int) -> int:
+    return MAC_HELLO if kind == KIND_HELLO else MAC_AUDIO
+
+
+def peek_kind(dgram: bytes) -> int:
+    return -1 if len(dgram) < HDR_LEN else dgram[4]
+
+
+def parse(dgram: bytes, mac_len: int = 0) -> Tuple[int, int, bytes, bytes]:
     """返回 (kind, turn_id, payload)。"""
     if len(dgram) < HDR_LEN:
         raise BadDatagram(f"short datagram {len(dgram)}B")
@@ -52,11 +63,28 @@ def parse(dgram: bytes) -> Tuple[int, int, bytes]:
         raise BadDatagram(f"payload too large {plen}")
     if HDR_LEN + plen > len(dgram):
         raise BadDatagram(f"truncated: header says {plen}, have {len(dgram) - HDR_LEN}")
-    return kind, turn, dgram[HDR_LEN:HDR_LEN + plen]
+    end = HDR_LEN + plen
+    if end + mac_len != len(dgram):
+        raise BadDatagram(f"size mismatch: {len(dgram)}B, want {end + mac_len}B")
+    return kind, turn, dgram[HDR_LEN:end], dgram[end:end + mac_len]
 
 
-def build(kind: int, turn: int, payload: bytes = b"") -> bytes:
-    return HDR.pack(b"PAV1", kind, 0, 0, turn, len(payload)) + payload
+def build(kind: int, turn: int, payload: bytes = b"", mac: bytes = b"") -> bytes:
+    return HDR.pack(b"PAV1", kind, 0, 0, turn, len(payload)) + payload + mac
+
+
+def sign(secret: bytes, body: bytes, mac_len: int) -> bytes:
+    """头部+载荷的截断 HMAC；body 就是不带 MAC 的完整数据报。"""
+    import hashlib
+    import hmac as _hmac
+
+    return _hmac.new(secret, body, hashlib.sha256).digest()[:mac_len]
+
+
+def verify(secret: bytes, body: bytes, mac: bytes) -> bool:
+    import hmac as _hmac
+
+    return _hmac.compare_digest(sign(secret, body, len(mac)), mac)
 
 
 class Reorder:

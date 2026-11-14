@@ -968,7 +968,15 @@ class Session:
                 with contextlib.suppress(asyncio.CancelledError):
                     await producer
 
-    async def send_down_frame(self, turn_id: int, frame: bytes) -> None:
+    def _secret(self):
+        """本设备的共享密钥；没有就返回 None（此时 UDP 一律不发）。"""
+        try:
+            return self.service.cfg.devices.get(self.device_id)
+        except Exception:  # noqa: BLE001 - 配置缺失按"没密钥"处理
+            return None
+
+    async def send_down_frame(self, turn_id: int, frame: bytes,
+                              seq: int = None) -> None:
         """One downlink frame: UDP/ADPCM once punched, otherwise TCP/PCM.
 
         640 B of PCM straight over UDP is 64 KB/s; this link measured 18.7 KB/s,
@@ -981,11 +989,21 @@ class Session:
         if (self.udp_peer is not None and self.udp_transport is not None
                 and not self.udp_transport.is_closing()):
             blk, self._down_state = adpcm.encode_block(frame, self._down_state)
-            payload = adpcm.encode_payload(self._down_seq, blk)
-            self._down_seq = (self._down_seq + 1) & 0xFFFFFFFF
+            # seq 默认顺次分配；显式传入只给台架用——它要让 seq 跟着帧号走，
+            # 这样"倒序发送"在接收端才是可识别的乱序。
+            use = self._down_seq if seq is None else (seq & 0xFFFFFFFF)
+            payload = adpcm.encode_payload(use, blk)
+            self._down_seq = ((use + 1) if seq is None
+                              else max(self._down_seq, use + 1)) & 0xFFFFFFFF
+            body = audio_udp.build(audio_udp.KIND_ADPCM, turn_id, payload)
+            secret = self._secret()
+            if secret is None:          # 没有密钥就不发未签名的包，宁可退回 TCP
+                self.udp_peer = None
+                await self.send_down_frame(turn_id, frame)
+                return
+            dgram = body + audio_udp.sign(secret, body, audio_udp.MAC_AUDIO)
             try:
-                self.udp_transport.sendto(
-                    audio_udp.build(audio_udp.KIND_ADPCM, turn_id, payload), self.udp_peer)
+                self.udp_transport.sendto(dgram, self.udp_peer)
             except OSError:
                 self.udp_peer = None      # fall back at once: a silent turn is worse
                 await self.send_down_frame(turn_id, frame)
@@ -1144,6 +1162,8 @@ class Service:
         self._udp_addrs: Dict[tuple, str] = {}
         self._udp_transport = None
         self.udp_hello = 0
+        self.udp_unauth = 0
+        self.udp_badmac = 0
         self.udp_datagrams = 0
         self.udp_bad = 0
         self.udp_errors = 0
@@ -1191,16 +1211,44 @@ class Service:
         if not hmac.compare_digest(expected, str(mac_hex).lower()):
             raise PermissionError("hmac mismatch")
 
+    def _udp_peer_allowed(self, device_id: str) -> bool:
+        sess = self.sessions.get(device_id)
+        return sess is not None and sess.control is not None and bool(sess.control.authed)
+
     def on_udp_datagram(self, data: bytes, addr, transport) -> None:
         """UDP 数据报入口。必须同步、必须快：慢了内核缓冲就被后面的包冲掉。"""
         self.udp_datagrams += 1
+        kind = audio_udp.peek_kind(data)
+        if kind < 0:
+            self.udp_bad += 1
+            return
+        mac_len = audio_udp.mac_len_for(kind)
         try:
-            kind, turn, payload = audio_udp.parse(data)
+            kind, turn, payload, mac = audio_udp.parse(data, mac_len)
         except audio_udp.BadDatagram:
             self.udp_bad += 1
             return
+        body = data[:len(data) - mac_len]
         if kind == audio_udp.KIND_HELLO:
             dev = payload.decode("ascii", "replace").strip()
+            # HELLO payload is a bare device id: anyone can claim someone else's.
+            # Without an authenticated control session we must not bind the
+            # address, or any internet host could inject audio into this device's
+            # ASR turn. The TCP audio channel proves itself with an HMAC
+            # handshake; UDP has no such thing, so the control session is the
+            # only trustworthy anchor.
+            if not self._udp_peer_allowed(dev):
+                self.udp_unauth += 1
+                if self.udp_unauth <= 5:
+                    log.warning("udp hello from %s:%d claims %r with no authenticated "
+                                "session; ignored", addr[0], addr[1], dev)
+                return
+            secret = self.cfg.devices.get(dev)
+            if secret is None or not audio_udp.verify(secret, body, mac):
+                self.udp_badmac += 1
+                if self.udp_badmac <= 5:
+                    log.warning("udp hello from %s:%d claims %r: bad mac", addr[0], addr[1], dev)
+                return
             fresh = self._udp_addrs.get(addr) != dev
             self._udp_addrs[addr] = dev
             sess = self.sessions.get(dev)
@@ -1210,7 +1258,8 @@ class Service:
                 sess.udp_peer = addr
                 sess.udp_transport = transport
             self.udp_hello += 1
-            transport.sendto(audio_udp.build(audio_udp.KIND_HELLO, 0), addr)
+            ack = audio_udp.build(audio_udp.KIND_HELLO, 0)
+            transport.sendto(ack + audio_udp.sign(secret, ack, audio_udp.MAC_HELLO), addr)
             if fresh:
                 log.info("%s udp hello from %s:%d", dev, addr[0], addr[1])
             return
@@ -1220,8 +1269,12 @@ class Service:
             self.udp_bad += 1
             return
         session = self.sessions.get(dev)
-        if session is None:
+        if session is None or not self._udp_peer_allowed(dev):
             self.udp_bad += 1
+            return
+        secret = self.cfg.devices.get(dev)
+        if secret is None or not audio_udp.verify(secret, body, mac):
+            self.udp_badmac += 1
             return
         if kind == audio_udp.KIND_ADPCM:
             session.on_udp_adpcm(turn, int.from_bytes(payload[:4], "little"),
@@ -1369,19 +1422,19 @@ class Service:
                     return pcm
 
                 for i in range(n):
-                    pending_frames.append(_tone(i))
+                    pending_frames.append((i, _tone(i)))
                     # shuffle: hold two frames and send them reversed, which is
                     # what a real path does occasionally. Without a reorder
                     # window on the device this lands in the playback ring and
                     # swaps two adjacent 20 ms blocks.
                     if shuffle and len(pending_frames) < 2:
                         continue
-                    for pcm in reversed(pending_frames):
-                        await session.send_down_frame(turn, pcm)
+                    for idx, pcm in reversed(pending_frames):
+                        await session.send_down_frame(turn, pcm, seq=idx)
                         await asyncio.sleep(0.02)
                     pending_frames.clear()
-                for pcm in pending_frames:
-                    await session.send_down_frame(turn, pcm)
+                for idx, pcm in pending_frames:
+                    await session.send_down_frame(turn, pcm, seq=idx)
                     await asyncio.sleep(0.02)
                 if session.control is not None:
                     with contextlib.suppress(Exception):
