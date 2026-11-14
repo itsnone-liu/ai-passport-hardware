@@ -26,6 +26,7 @@ import struct
 MAGIC = b"PAV1"
 KIND_PCM, KIND_HELLO, KIND_END, KIND_AUTH = 1, 2, 3, 4
 MAX_PAYLOAD = 4096
+DEFAULT_ACTIVE_TURN = 12  # the turn the session is already inside when a stream starts
 
 # Throwaway values, test-only; the real device secret never appears in this repo.
 TEST_SECRET = b"vector-secret-0001"
@@ -77,10 +78,18 @@ def frame_entry(name, intent, kind, turn_id, payload, expect_frames, expect_erro
     }
 
 
-def stream_entry(name, intent, segments, expect_frames, expect_error=None):
+def stream_entry(name, intent, segments, expect_frames, expect_error=None, pre=None):
+    """pre = session-layer precondition; the bytes alone cannot express it.
+
+    A framer only sees bytes, so "PCM before AUTH" and "PCM after END" are
+    indistinguishable from a normal turn without knowing the session state the
+    test starts in. Recording that here keeps the vectors executable rather
+    than descriptive.
+    """
     return {
         "name": name,
         "intent": intent,
+        "pre": pre if pre is not None else {"authed": True, "active_turn": DEFAULT_ACTIVE_TURN},
         "segments_hex": [s.hex() for s in segments],
         "bytes": sum(len(s) for s in segments),
         "expect": {"frames": expect_frames, "error": expect_error},
@@ -164,11 +173,12 @@ def build():
                      [{"kind": KIND_PCM, "turn_id": TURN, "payload_len": 640}], "TURN_MISMATCH"),
         stream_entry("preauth_pcm",
                      "audio before a successful AUTH must be refused",
-                     [frame(KIND_PCM, TURN, pcm20)], [], "NOT_AUTHED"),
+                     [frame(KIND_PCM, TURN, pcm20)], [], "NOT_AUTHED",
+                     pre={"authed": False, "active_turn": None}),
         stream_entry("auth_bad_mac",
-                     "well-formed AUTH frame carrying a wrong HMAC", 
-                     [frame(KIND_AUTH, 0, bad_auth_payload)], [],
-                     "AUTH_FAILED"),
+                     "well-formed AUTH frame carrying a wrong HMAC",
+                     [frame(KIND_AUTH, 0, bad_auth_payload)], [], "AUTH_FAILED",
+                     pre={"authed": False, "active_turn": None}),
         stream_entry("truncated_stream",
                      "connection dies mid-header; the incomplete frame is dropped on close",
                      [frame(KIND_PCM, TURN, pcm20)[:9]], [], "INCOMPLETE_FRAME"),
