@@ -56,8 +56,15 @@ void terminal_pav1_start(const char *host, int port);
 void terminal_pav1_stop(void);
 bool terminal_pav1_ready(void);
 
+// 正在建立/重建音频通道（连接中，尚不可送帧）。
+// 与 ready 区分开：服务端据此知道"等一会儿再试"而不是"设备不支持"。
+bool terminal_pav1_starting(void);
+
 // 上行一帧 PCM（turn_id 由调用方给）。返回实际发出的字节数，0 = 通道不可用。
 int terminal_pav1_send_pcm(uint32_t turn_id, const void *pcm, size_t n);
+
+// 上行 END 帧（零载荷），标志该轮上传结束（§5）。
+bool terminal_pav1_send_end(uint32_t turn_id);
 
 // 上行自测：由通道任务发若干帧 1 kHz 正弦，用于验证对端帧边界是否正确。
 bool terminal_pav1_request_uplink_test(uint32_t frames, uint32_t tone_hz);

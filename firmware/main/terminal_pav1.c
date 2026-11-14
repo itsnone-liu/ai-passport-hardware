@@ -539,12 +539,19 @@ void terminal_pav1_stop(void) {
 
 bool terminal_pav1_ready(void) { return s_ready; }
 
+bool terminal_pav1_starting(void) { return s_should_run && !s_ready; }
+
 int terminal_pav1_send_pcm(uint32_t turn_id, const void *pcm, size_t n) {
     if (!s_ready || !pcm || n == 0 || n > PAV1_MAX_PAYLOAD) return 0;
     if (!send_frame(PAV1_K_PCM, turn_id, pcm, (uint32_t)n)) return 0;
     s_tx_frames++;
     s_tx_bytes += (uint32_t)n;
     return (int)n;
+}
+
+bool terminal_pav1_send_end(uint32_t turn_id) {
+    if (!s_ready) return false;
+    return send_frame(PAV1_K_END, turn_id, NULL, 0);
 }
 
 bool terminal_pav1_request_uplink_test(uint32_t frames, uint32_t tone_hz) {

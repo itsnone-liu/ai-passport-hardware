@@ -16,6 +16,7 @@
 #include "terminal_audio.h"
 #include "terminal_auth.h"
 #include "terminal_pav1.h"
+#include "terminal_capture.h"
 #include "terminal_ui.h"
 
 #include <stdarg.h>
@@ -136,17 +137,19 @@ static void reply_status(const link_reply_t *to, int id) {
         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_DEFAULT);
     char audio[192];
     terminal_pav1_describe(audio, sizeof audio);
+    char cap[96];
+    terminal_capture_describe(cap, sizeof cap);
     reply_fmt(to, "{\"id\":%d,\"ok\":true,\"cmd\":\"status\",\"device_id\":\"%s\",\"battery\":%d,\"mv\":%d,"
                   "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld,"
                   "\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u,"
-                  "\"auth\":\"%s\",\"session\":\"%s\",\"audio_port\":%d,%s}\n",
+                  "\"auth\":\"%s\",\"session\":\"%s\",\"audio_port\":%d,%s,%s}\n",
               id, terminal_auth_device_id(), soc, mv, terminal_ui_volume(), terminal_ui_brightness(),
               (long long)up, heap_now,
               heap_min, heap_blk,
               terminal_auth_authorized()
                   ? (terminal_auth_has_secret() ? "ok" : "none")
                   : (terminal_auth_handshaking() ? "pending" : "none"),
-              terminal_auth_session_id(), terminal_auth_audio_port(), audio);
+              terminal_auth_session_id(), terminal_auth_audio_port(), audio, cap);
 }
 
 static void apply_volume(int value) {
@@ -359,6 +362,61 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
                       "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.uplink_test\",\"err\":\"not_supported\"}\n",
                       id);
         }
+    } else if (strcmp(c, "capture.start") == 0) {
+        // §6.3/§6.5：已有活动轮次时拒绝为 busy；音频通道不在就如实说不支持，
+        // 不假装开了轮次（假成功会让服务端一直等 PCM）。
+        const uint32_t turn = (uint32_t)int_field(root, "turn_id", 0);
+        const esp_err_t err = terminal_capture_start(turn);
+        if (err == ESP_OK) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"capture.start\",\"turn_id\":%u}\n", id,
+                      (unsigned)turn);
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.start\",\"err\":\"busy\"}\n", id);
+        } else {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.start\",\"err\":\"not_supported\","
+                      "\"detail\":\"audio channel down\"}\n",
+                      id);
+        }
+    } else if (strcmp(c, "capture.stop") == 0) {
+        const uint32_t turn = (uint32_t)int_field(root, "turn_id", 0);
+        const esp_err_t err = terminal_capture_stop(turn);
+        if (err == ESP_OK) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"capture.stop\",\"turn_id\":%u}\n", id,
+                      (unsigned)turn);
+        } else if (err == ESP_ERR_INVALID_ARG) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.stop\",\"err\":\"turn_mismatch\"}\n",
+                      id);
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"capture.stop\",\"err\":\"turn_closed\"}\n",
+                      id);
+        }
+    } else if (strcmp(c, "get_audio") == 0) {
+        char audio[224];
+        terminal_capture_get_audio(audio, sizeof audio);
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"get_audio\",%s}\n", id, audio);
+    } else if (strcmp(c, "state.set") == 0) {
+        const cJSON *st = cJSON_GetObjectItemCaseSensitive(root, "state");
+        static const char *k_states[] = {"idle", "listening", "processing", "speaking", "error"};
+        bool known = false;
+        if (cJSON_IsString(st))
+            for (size_t i = 0; i < sizeof k_states / sizeof k_states[0]; i++)
+                if (strcmp(st->valuestring, k_states[i]) == 0) known = true;
+        if (!known) {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"state.set\",\"err\":\"bad_json\"}\n", id);
+        } else {
+            // 真去改屏幕，不是只存一个字符串（§6.5：不假成功）。
+            if (bsp_lvgl_lock(200)) {
+                terminal_ui_set_message(st->valuestring);
+                bsp_lvgl_unlock();
+            }
+            reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"state.set\",\"state\":\"%s\"}\n", id,
+                      st->valuestring);
+        }
+    } else if (strcmp(c, "vendor.capture_arm") == 0) {
+        // 厂商扩展：按键起采的等价入口，用来在没有人在设备旁边时验证 pre-roll。
+        terminal_capture_arm();
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.capture_arm\"}\n", id);
     } else if (strcmp(c, "vendor.audio_reconnect") == 0) {
         // 厂商扩展：§3.3 禁止"常开无限重试"，所以连败三次后音频通道会自己停手。
         // 这是操作员的手动重试入口——触发一次只重试一轮，不是守护循环。

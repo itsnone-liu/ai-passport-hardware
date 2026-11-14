@@ -13,6 +13,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "terminal_link.h"
+#include "terminal_capture.h"
 #include "terminal_auth.h"
 #include "terminal_pav1.h"
 #include "terminal_net.h"
@@ -77,6 +78,10 @@ static void key_task(void *arg) {
                     bsp_lvgl_unlock();
                 }
                 bsp_display_backlight((uint8_t)bright);
+            } else if (e.btn == BSP_BTN_OK && e.ev == BSP_BTN_CLICK) {
+                // 说话键：先在本地起采把 300 ms pre-roll 填起来，
+                // 免得等服务端 capture.start 往返之后才听到"第一声"。
+                terminal_capture_arm();
             }
 
             if (changed) {
@@ -112,6 +117,7 @@ void app_main(void) {
     terminal_net_preload();  // 配置先于 USB 通道就绪，避免开机瞬间 get_net 答空值
     terminal_auth_init();    // 设备 id 与密钥：必须在第一次握手之前就绪
     terminal_pav1_init();    // 音频通道任务（等 auth 通过后才会真连）
+    terminal_capture_init(); // 采集任务（按键起采 / capture.start）
 
     bsp_i2c_init();
     bsp_i2c_scan();
