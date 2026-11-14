@@ -59,6 +59,7 @@ class Config:
     bailian_base_url: str = "https://token-plan.cn-beijing.maas.aliyuncs.com"
     bailian_asr_model: str = "qwen-audio-3.0-realtime-plus"
     bailian_tts_model: str = "qwen-audio-3.0-tts-plus"
+    bailian_llm_model: str = "deepseek-v4.1-flash-1017"   # 对话用快模型：ASR 已经吃掉 3 s，LLM 不能再添
     bailian_voice: str = "longanlingxin"
 
     # dsh connector (only used when brain == "dsh"); unverified against the real

@@ -937,6 +937,12 @@ class Session:
                 raise first
             if first is producer_done:
                 return
+            # 每轮从 seq=0、编码器初值、FEC 组空开始。跨轮沿用会让一个奇偶组
+            # 横跨两轮，恢复出来的块会挂到错误的 turn 上；ADPCM 预测器跨轮
+            # 延续也会让新一轮的第一个字带着上一轮的尾巴。
+            self._down_seq = 0
+            self._down_state = (0, 0)
+            self._fec_acc = None
             reply = await self.control.request("playback.start", self.cfg.request_timeout,
                                                turn_id=turn_id)
             log.info("%s playback.start turn=%d -> %s", self.device_id, turn_id, reply)
@@ -1071,13 +1077,16 @@ class Session:
             if len(frame) < step and off + step > len(audio):
                 break               # partial tail is dropped, not padded into the speaker
             t_send = asyncio.get_running_loop().time()
-            await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)
+            # 走统一的下行入口：UDP 已打洞就 ADPCM/FEC/UDP，否则回退 TCP/PCM。
+            # 直连 send_frame(KIND_PCM) 的老写法让 UAC 与台架走了两条不同的路。
+            await self.send_down_frame(turn_id, frame)
             blocked = asyncio.get_running_loop().time() - t_send
             if blocked > self._max_send_block:
                 self._max_send_block = blocked
             if m.downlink_bytes == 0:
-                log.info("%s first PCM frame turn=%d len=%d", self.device_id, turn_id,
-                         len(frame))
+                log.info("%s first downlink frame turn=%d len=%d via %s", self.device_id,
+                         turn_id, len(frame),
+                         "udp" if self.udp_peer is not None else "tcp")
             m.downlink_bytes += len(frame)
             if m.tts_first_ms is None:
                 m.tts_first_ms = self.service.now_ms()

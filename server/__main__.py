@@ -36,7 +36,11 @@ def build_backends(cfg: Config):
     else:
         tts = MockTTS()
 
-    if cfg.brain == "dsh":
+    if cfg.brain == "bailian":
+        from server.dsh.bailian import BailianLLMBrain
+        brain = BailianLLMBrain(cfg.bailian_api_key, cfg.bailian_base_url,
+                                cfg.bailian_llm_model)
+    elif cfg.brain == "dsh":
         if not cfg.dsh_url:
             raise SystemExit("brain=dsh requires dsh_url; see server/dsh/README.md")
         from server.dsh.http import DshHTTPBrain

@@ -129,3 +129,73 @@ TTS → 回放出声。此前所有采集都是环境声（`rms` 25–26），AS
 `OK+RELEASE → capture_request_end()`。旧代码只认 CLICK，人手按住必然超过
 500 ms 被判成 LONG 去调亮度，采集一次都没启动过——这就是之前真人测试
 一直失败的真因，已修。
+
+## §5 接真 LLM（DeepSeek）
+
+`brain=mock` → `brain=bailian-llm`（云百炼 token-plan 的 DeepSeek）。
+
+选型不是拍脑袋，是量过首字延迟的：
+
+| 模型 | 首字（含思考） | 首字（`enable_thinking:false`） |
+|---|---|---|
+| `qwen3.8-flash` | 4182 ms | — |
+| `deepseek-v4.1-flash-1017` | — | **1207 ms** |
+| `deepseek-v4-flash-0731` | — | 1481 ms |
+| `deepseek-v4-pro` | 3222 ms | 1963 ms |
+
+两个坑：
+
+1. **思考模式默认开着**。deepseek 系列把正文放在 `content`、思考放在
+   `reasoning_content`；不关思考时流里只有后者，而原来的解析只读 `content`，
+   于是"成功请求、正文为空"。关掉 `enable_thinking` 后首字从 3–4 s 降到
+   1.2 s。代码里如果关掉后仍只收到思考，会显式抛错，而不是把内心独白
+   念给用户听。
+2. **多轮记忆**：按 session 保留最近 6 轮。实测第二问"我刚才问你什么了"
+   答得回去（`你刚才问的是今天天气怎么样`）。
+
+直测（绕过设备）：
+
+```
+Q 今天天气怎么样？
+  首字 1086 ms / 总 1505 ms / 13 块
+Q 我刚才问你什么了？
+  首字  923 ms / 总  996 ms / 3 块
+```
+
+## §6 回放下行切到 UDP/ADPCM
+
+之前 §4 的结论是"回放还在走 TCP/PCM"。根因不是 UDP 通道没做好，而是
+**真实回放从来没调用 `send_down_frame`**：
+
+```
+await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)   # 640 B/帧，TCP
+```
+
+台架 `push_udp` 直接调 `send_down_frame`（UDP 优先、失败回退 TCP），所以
+"下行 UDP 通过"这个结论一直只对台架成立。改成走统一入口后：
+
+```
+first downlink frame turn=1 len=640 via udp
+```
+
+一次回放（"下行现在走 UDP 了…"）的实测：
+
+| 指标 | 切换前（TCP） | 切换后（UDP） |
+|---|---|---|
+| `udp_down` | 130（不动） | **292（+162）** |
+| `udp_parity` | 50 | **101（+51）** |
+| `udp_recovered` | 15 | 16（FEC 救回 1 块） |
+| `play_overflows` | 1 | **0** |
+| `play_underruns` | 0 | **1** |
+| 单帧 640 B → | 640 B 上线 | 188 B 上线（8.4 KB/s） |
+
+另外每轮开始重置 `_down_seq`/`_down_state`/`_fec_acc`：跨轮沿用会让一个
+奇偶组横跨两轮，恢复出来的块挂到错误的 turn 上。
+
+服务端测试 85 passed, 3 skipped。
+
+### 还没解决的
+
+- `play_underruns=1`：TCP 时是 0，切 UDP 后出现一次。怀疑是开头
+  prebuffer 差一点（`playback_lead=0.12s`），需要按发生位置确认。
+- 上行仍无 FEC（实测 `lost=0`，暂未暴露）。
