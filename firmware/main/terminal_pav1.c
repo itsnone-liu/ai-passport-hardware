@@ -25,7 +25,7 @@ static const char *TAG = "pav1";
 #define HANDSHAKE_TIMEOUT_MS 3000
 #define RECV_TIMEOUT_S 1  // 短一点：空闲时也要能及时响应"该发帧了"这类本地请求
 #define IDLE_DROP_S 180
-#define RX_BUF 1024
+#define RX_BUF 4096  // 一次 recv 尽量多取：1024 B 只能装 1.6 帧，收得再快也补不回窗口
 
 static const uint8_t k_magic[4] = {'P', 'A', 'V', '1'};
 
@@ -278,6 +278,10 @@ static int dial(const char *host, int port) {
     // lwip 默认发送缓冲只有几 KB，32 KB/s 的上行一旦 RTT 稍大就会被自己的缓冲卡住。
     int sndbuf = 16384;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
+    // 下行同理：205 ms RTT 下 5760 B 窗口只够 28 KB/s，低于实时所需的 31.2 KB/s。
+    // 窗口是这一端"允许对端在途多少字节"，太小就是在自己身上设了个带宽上限。
+    int rcvbuf = 16384;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
     if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
         close(fd);
         freeaddrinfo(res);
