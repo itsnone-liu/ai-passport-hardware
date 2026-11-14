@@ -93,8 +93,10 @@ static void tick_cb(void *arg) {
         .volume = terminal_ui_volume(),
         .brightness = terminal_ui_brightness(),
         .uptime_s = esp_timer_get_time() / 1000000,
-        .link_mode = terminal_net_ready() ? UI_LINK_NET
-                     : (terminal_proto_ready() ? UI_LINK_USB : UI_LINK_NONE),
+        .link_mode = terminal_net_ready()    ? UI_LINK_NET
+                     : terminal_net_ip_ready() ? UI_LINK_WIFI
+                     : terminal_proto_ready()  ? UI_LINK_USB
+                                               : UI_LINK_NONE,
     };
     if (bsp_lvgl_lock(100)) {
         terminal_ui_refresh(&st);

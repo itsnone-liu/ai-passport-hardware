@@ -5,10 +5,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// 链路状态：0 = 无载体，1 = 仅 USB，2 = 网络（WebSocket 已连）
+// 链路状态：0 = 无载体，1 = 仅 USB，2 = Wi-Fi 已连但服务器未通，3 = TCP 已连
 #define UI_LINK_NONE 0
 #define UI_LINK_USB 1
-#define UI_LINK_NET 2
+#define UI_LINK_WIFI 2
+#define UI_LINK_NET 3
 
 typedef struct {
     int battery_pct;      // -1 = 电量计不可用

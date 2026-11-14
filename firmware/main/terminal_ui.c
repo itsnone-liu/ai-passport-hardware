@@ -129,8 +129,10 @@ void terminal_ui_refresh(const terminal_status_t *st) {
         lv_label_set_text(s_lbl_up, buf);
     }
     if (s_lbl_link) {
+        // 四态：分不清"Wi-Fi 没连上"和"Wi-Fi 通了但服务器不通"是最常见的现场困惑
         const char *txt = "--";
         if (st->link_mode >= UI_LINK_NET) txt = "NET OK";
+        else if (st->link_mode == UI_LINK_WIFI) txt = "WIFI";
         else if (st->link_mode == UI_LINK_USB) txt = "USB OK";
         lv_label_set_text(s_lbl_link, txt);
     }

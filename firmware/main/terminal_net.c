@@ -395,3 +395,5 @@ esp_err_t terminal_net_scan(char *buf, size_t n) {
 }
 
 bool terminal_net_ready(void) { return s_connected; }
+
+bool terminal_net_ip_ready(void) { return s_ip_ready; }

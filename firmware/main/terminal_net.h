@@ -16,6 +16,9 @@ esp_err_t terminal_net_start(void);
 // TCP 是否已连上服务器（UI 用它决定显示 USB 还是 NET）。
 bool terminal_net_ready(void);
 
+// Wi-Fi 是否已连上并拿到 IP（服务器还不一定通）。
+bool terminal_net_ip_ready(void);
+
 // 更新并持久化网络参数，然后断开重连。任一参数传 NULL 表示保持原值；port <= 0 同理。
 esp_err_t terminal_net_apply(const char *ssid, const char *password, const char *host, int port);
 
