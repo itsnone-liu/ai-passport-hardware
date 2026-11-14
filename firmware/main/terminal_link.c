@@ -16,6 +16,7 @@
 #include "terminal_audio.h"
 #include "terminal_auth.h"
 #include "terminal_pav1.h"
+#include "terminal_boot.h"
 #include "terminal_capture.h"
 #include "terminal_playback.h"
 #include "terminal_ui.h"
@@ -143,10 +144,17 @@ static void reply_status(const link_reply_t *to, int id) {
     reply_fmt(to, "{\"id\":%d,\"ok\":true,\"cmd\":\"status\",\"device_id\":\"%s\",\"battery\":%d,\"mv\":%d,"
                   "\"volume\":%d,\"brightness\":%d,\"uptime\":%lld,"
                   "\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u,"
+                  "\"boot\":%u,\"reset\":\"%s\",\"reset_code\":%d,"
+                  "\"prev_heap_min\":%u,\"prev_heap_block\":%u,"
+                  "\"prev_uptime\":%u,"
                   "\"auth\":\"%s\",\"session\":\"%s\",\"audio_port\":%d,%s,%s}\n",
               id, terminal_auth_device_id(), soc, mv, terminal_ui_volume(), terminal_ui_brightness(),
               (long long)up, heap_now,
               heap_min, heap_blk,
+              (unsigned)terminal_boot_count(), terminal_boot_reason(),
+              terminal_boot_reason_code(),
+              (unsigned)terminal_boot_prev_heap_min(), (unsigned)terminal_boot_prev_heap_block(),
+              (unsigned)terminal_boot_prev_uptime_s(),
               terminal_auth_authorized()
                   ? (terminal_auth_has_secret() ? "ok" : "none")
                   : (terminal_auth_handshaking() ? "pending" : "none"),
@@ -498,13 +506,25 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
                       id);
         }
     } else if (strcmp(c, "vendor.rtt") == 0) {
-        // 从设备侧量到服务器的真实 RTT 与 SYN 失败率：判断"是不是在窄带 WAN 上"。
+        // 从设备侧量到服务器的真实 RTT 与 SYN 失败率。同步回执带全部统计值：
+        // 异步 event 需要调用方再差分一次，而差分遇到重启就整段失效。
         const char *host = str_field(root, "host", terminal_net_host());
         const int port = int_field(root, "port", terminal_net_port());
         const int tries = int_field(root, "tries", 6);
-        const esp_err_t err = terminal_net_rtt_test(host, port, tries);
-        reply_fmt(reply, "{\"id\":%d,\"ok\":%s,\"cmd\":\"vendor.rtt\",\"host\":\"%s\",\"port\":%d}\n",
-                  id, err == ESP_OK ? "true" : "false", host, port);
+        rtt_stat_t st = {0};
+        const esp_err_t err = terminal_net_rtt(host, port, tries, &st);
+        if (err == ESP_OK) {
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.rtt\",\"host\":\"%s\",\"port\":%d,"
+                      "\"tries\":%d,\"success\":%d,\"fail\":%d,\"min_ms\":%d,\"avg_ms\":%d,"
+                      "\"max_ms\":%d,\"heap\":%u,\"heap_min\":%u,\"boot\":%u}\n",
+                      id, host, port, st.tries, st.success, st.fail, st.min_ms, st.avg_ms, st.max_ms,
+                      (unsigned)esp_get_free_heap_size(),
+                      (unsigned)esp_get_minimum_free_heap_size(),
+                      (unsigned)terminal_boot_count());
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.rtt\",\"err\":\"resolve\"}\n", id);
+        }
     } else if (strcmp(c, "vendor.tcp_accept") == 0) {
         // 设备监听、对端连进来灌数据：绕开 Windows 入站防火墙，测同一段接收路径。
         const int port = int_field(root, "port", 18182);
@@ -512,16 +532,38 @@ void terminal_link_dispatch(char *line, const link_reply_t *reply) {
         reply_fmt(reply, "{\"id\":%d,\"ok\":%s,\"cmd\":\"vendor.tcp_accept\",\"port\":%d}\n", id,
                   err == ESP_OK ? "true" : "false", port);
     } else if (strcmp(c, "vendor.rx_rate") == 0) {
-        // 只读不播：把"读循环上限"和"播放路径开销"分开量。
+        // 只读不播：把"读循环上限"和"播放路径开销"分开量。同步回执带统计值。
         const int ms = int_field(root, "ms", 2000);
-        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.rx_rate\",\"ms\":%d}\n", id, ms);
-        terminal_pav1_rx_rate_start(ms);
+        uint32_t frames = 0, bytes = 0;
+        int elapsed = 0;
+        const esp_err_t err = terminal_pav1_rx_rate(ms, &frames, &bytes, &elapsed);
+        if (err == ESP_OK) {
+            const int fps_x10 = elapsed ? (int)((int64_t)frames * 10000 / elapsed) : 0;
+            const int kbps_x10 = elapsed ? (int)((int64_t)bytes * 10 / elapsed) : 0;
+            reply_fmt(reply,
+                      "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.rx_rate\",\"ms\":%d,\"elapsed_ms\":%d,"
+                      "\"frames\":%u,\"bytes\":%u,\"fps\":%d.%d,\"kbps\":%d.%d,"
+                      "\"heap\":%u,\"heap_min\":%u,\"boot\":%u}\n",
+                      id, ms, elapsed, (unsigned)frames, (unsigned)bytes, fps_x10 / 10, fps_x10 % 10,
+                      kbps_x10 / 10, kbps_x10 % 10, (unsigned)esp_get_free_heap_size(),
+                      (unsigned)esp_get_minimum_free_heap_size(),
+                      (unsigned)terminal_boot_count());
+        } else {
+            reply_fmt(reply, "{\"id\":%d,\"ok\":false,\"cmd\":\"vendor.rx_rate\",\"err\":\"no_audio\"}\n",
+                      id);
+        }
     } else if (strcmp(c, "vendor.wifi_ps") == 0) {
         // 0=NONE 1=MIN_MODEM 2=MAX_MODEM，运行时切换以便 A/B。
         const int mode = int_field(root, "mode", 0);
         const esp_err_t err = terminal_net_set_ps(mode);
         reply_fmt(reply, "{\"id\":%d,\"ok\":%s,\"cmd\":\"vendor.wifi_ps\",\"mode\":%d}\n", id,
                   err == ESP_OK ? "true" : "false", mode);
+    } else if (strcmp(c, "vendor.crash") == 0) {
+        // 自检：故意 panic 一次，验证复位取证真的能指出 panic 而不是"unknown"。
+        // 一个只在正常路径验证过的取证工具等于没有——崩溃那条路必须也走过一遍。
+        reply_fmt(reply, "{\"id\":%d,\"ok\":true,\"cmd\":\"vendor.crash\",\"note\":\"rebooting\"}\n", id);
+        vTaskDelay(pdMS_TO_TICKS(150));  // 让回执先发出去，否则对面只看到连接断开
+        abort();
     } else if (strcmp(c, "vendor.capture_arm") == 0) {
         // 厂商扩展：按键起采的等价入口，用来在没有人在设备旁边时验证 pre-roll。
         terminal_capture_arm();

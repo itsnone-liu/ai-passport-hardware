@@ -555,44 +555,24 @@ uint32_t terminal_pav1_tx_frames(void) { return s_tx_frames; }
 // ---- 隔离实验：只从音频 socket 读、解析、计数，不推环、不播放 ----
 // 目的：把"读循环的上限"和"播放路径的开销"分开量。若这里也只有 15–25 帧/秒，
 // 瓶颈在读循环/链路；若这里能到 50+ 帧/秒，说明是播放路径把读拖慢了。
-static void rx_rate_task(void *arg) {
-    const int ms = (int)(intptr_t)arg;
-    if (!s_ready || s_sock < 0) {
-        terminal_link_send_src(LINK_SRC_USB,
-                               "{\"event\":\"rx_rate\",\"ok\":false,\"err\":\"no_audio\"}\n");
-        vTaskDelete(NULL);
-        return;
-    }
+//
+// 同步返回统计值而不是发一个 event：异步 event 需要调用方再做一次 get_audio
+// 差分，而差分一旦遇到设备重启就整段失效（对方已经因此误判过一次）。
+esp_err_t terminal_pav1_rx_rate(int ms, uint32_t *frames, uint32_t *bytes, int *elapsed_ms) {
+    if (ms <= 0 || ms > 10000) return ESP_ERR_INVALID_ARG;
+    if (!s_ready || s_sock < 0) return ESP_ERR_INVALID_STATE;
     const uint32_t f0 = s_rx_frames, b0 = s_rx_bytes;
     const int64_t t0 = esp_timer_get_time();
     s_rx_only = true;
     vTaskDelay(pdMS_TO_TICKS(ms));
     s_rx_only = false;
     const int64_t dt = esp_timer_get_time() - t0;
-    const uint32_t df = s_rx_frames - f0, db = s_rx_bytes - b0;
-    const int elapsed_ms = (int)(dt / 1000);
-    const int fps_x10 = elapsed_ms ? (int)((int64_t)df * 10000 / elapsed_ms) : 0;
-    const int kbps_x10 = elapsed_ms ? (int)((int64_t)db * 10 / elapsed_ms) : 0;
-    ESP_LOGI(TAG, "rx_rate: %u 帧 / %u B / %d ms = %d.%d 帧/秒 = %d.%d KB/s", (unsigned)df,
-             (unsigned)db, elapsed_ms, fps_x10 / 10, fps_x10 % 10, kbps_x10 / 10, kbps_x10 % 10);
-    char ev[288];
-    snprintf(ev, sizeof ev,
-             "{\"event\":\"rx_rate\",\"ok\":true,\"ms\":%d,\"frames\":%u,\"bytes\":%u,"
-             "\"fps\":%d.%d,\"kbps\":%d.%d,\"heap\":%u,\"heap_min\":%u,\"heap_block\":%u}\n",
-             elapsed_ms, (unsigned)df, (unsigned)db, fps_x10 / 10, fps_x10 % 10, kbps_x10 / 10,
-             kbps_x10 % 10, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    terminal_link_send_src(LINK_SRC_USB, ev);
-    (void)t0;
-    vTaskDelete(NULL);
-}
-
-esp_err_t terminal_pav1_rx_rate_start(int ms) {
-    if (ms <= 0 || ms > 10000) return ESP_ERR_INVALID_ARG;
-    return xTaskCreate(rx_rate_task, "rx_rate", 3072, (void *)(intptr_t)ms, 4, NULL) == pdPASS
-               ? ESP_OK
-               : ESP_ERR_NO_MEM;
+    if (frames) *frames = s_rx_frames - f0;
+    if (bytes) *bytes = s_rx_bytes - b0;
+    if (elapsed_ms) *elapsed_ms = (int)(dt / 1000);
+    ESP_LOGI(TAG, "rx_rate: %u 帧 / %u B / %d ms", (unsigned)(s_rx_frames - f0),
+             (unsigned)(s_rx_bytes - b0), (int)(dt / 1000));
+    return ESP_OK;
 }
 
 bool terminal_pav1_starting(void) { return s_should_run && !s_ready; }

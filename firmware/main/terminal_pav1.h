@@ -62,8 +62,9 @@ uint32_t terminal_pav1_rx_frames(void);
 uint32_t terminal_pav1_rx_end(void);
 uint32_t terminal_pav1_tx_frames(void);
 
-// 隔离实验：ms 毫秒内只读音频 socket 并计数（不推环、不播放），报帧/秒与堆。
-esp_err_t terminal_pav1_rx_rate_start(int ms);
+// 隔离实验：ms 毫秒内只读音频 socket 并计数（不推环、不播放）。
+// 同步返回帧数/字节数/实际耗时，调用方拿到的就是本次窗口的统计，无需再做差分。
+esp_err_t terminal_pav1_rx_rate(int ms, uint32_t *frames, uint32_t *bytes, int *elapsed_ms);
 
 // 音频通道累计收发计数（get_audio 排障用）：
 // rx = 从服务端收到的 PCM 帧数（不含 END），tx = 已发出的 PCM 帧数。

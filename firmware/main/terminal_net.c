@@ -663,7 +663,7 @@ static void sink_task(void *arg) {
     struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    char portstr[8];
+    char portstr[12];
     snprintf(portstr, sizeof portstr, "%d", port);
     if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
         terminal_link_send_src(LINK_SRC_USB,
@@ -827,39 +827,24 @@ esp_err_t terminal_net_accept_test(int port) {
 
 // ---- 路径质量测量：n 次 TCP 连接（SYN→SYN-ACK 完成即一个 RTT）----
 // 连接失败也算一次样本：SYN 丢了就是最直接的丢包证据。
-static void rtt_task(void *arg) {
-    char *spec = (char *)arg;
-    char host[48] = {0};
-    int port = 0, n = 6;
-    if (sscanf(spec, "%47s %d %d", host, &port, &n) != 3) {
-        free(spec);
-        terminal_link_send_src(LINK_SRC_USB,
-                               "{\"event\":\"rtt\",\"ok\":false,\"err\":\"bad_args\"}\n");
-        vTaskDelete(NULL);
-        return;
-    }
-    free(spec);
-    if (n > 20) n = 20;
+// 同步返回统计：调用方一次拿到 min/avg/max 与失败数，不依赖日志或事件流。
+esp_err_t terminal_net_rtt(const char *host, int port, int tries, rtt_stat_t *out) {
+    if (!host || port <= 0 || tries <= 0) return ESP_ERR_INVALID_ARG;
+    if (tries > 10) tries = 10;
     struct addrinfo hints = {0}, *res = NULL;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    char portstr[8];
+    char portstr[12];
     snprintf(portstr, sizeof portstr, "%d", port);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
-        terminal_link_send_src(LINK_SRC_USB, "{\"event\":\"rtt\",\"ok\":false,\"err\":\"resolve\"}\n");
-        vTaskDelete(NULL);
-        return;
-    }
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return ESP_FAIL;
+
     int ok = 0, fail = 0, min_ms = 100000, max_ms = 0, sum_ms = 0;
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < tries; i++) {
         const int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
         if (fd < 0) {
             fail++;
             continue;
         }
-        // 连接超时要短于默认值：这里量的是"能不能在一个 RTT 内握上手"。
-        struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
         const int64_t t0 = esp_timer_get_time();
         const int rc = connect(fd, res->ai_addr, res->ai_addrlen);
         const int ms = (int)((esp_timer_get_time() - t0) / 1000);
@@ -872,28 +857,18 @@ static void rtt_task(void *arg) {
         } else {
             fail++;
         }
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(200));  // 别把连续 SYN 压成一簇，那样测到的是自己的队列
     }
     freeaddrinfo(res);
-    const int avg = ok ? sum_ms / ok : 0;
-    ESP_LOGI(TAG, "rtt: %s:%d ok=%d fail=%d min=%d avg=%d max=%d ms", host, port, ok, fail,
-             ok ? min_ms : 0, avg, max_ms);
-    char ev[256];
-    snprintf(ev, sizeof ev,
-             "{\"event\":\"rtt\",\"ok\":true,\"host\":\"%s\",\"port\":%d,\"tries\":%d,"
-             "\"success\":%d,\"fail\":%d,\"min_ms\":%d,\"avg_ms\":%d,\"max_ms\":%d}\n",
-             host, port, n, ok, fail, ok ? min_ms : 0, avg, max_ms);
-    terminal_link_send_src(LINK_SRC_USB, ev);
-    vTaskDelete(NULL);
-}
-
-esp_err_t terminal_net_rtt_test(const char *host, int port, int tries) {
-    char *spec = malloc(64);
-    if (!spec) return ESP_ERR_NO_MEM;
-    snprintf(spec, 64, "%s %d %d", host, port, tries);
-    if (xTaskCreate(rtt_task, "rtt", 4096, spec, 4, NULL) != pdPASS) {
-        free(spec);
-        return ESP_ERR_NO_MEM;
+    if (out) {
+        out->tries = tries;
+        out->success = ok;
+        out->fail = fail;
+        out->min_ms = ok ? min_ms : 0;
+        out->avg_ms = ok ? sum_ms / ok : 0;
+        out->max_ms = max_ms;
     }
+    ESP_LOGI(TAG, "rtt %s:%d ok=%d fail=%d min=%d avg=%d max=%d ms", host, port, ok, fail,
+             ok ? min_ms : 0, ok ? sum_ms / ok : 0, max_ms);
     return ESP_OK;
 }
