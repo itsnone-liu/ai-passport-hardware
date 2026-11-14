@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from server import adpcm, pav1
+from server import adpcm, audio_udp, pav1
 from server.config import Config
 
 log = logging.getLogger("passport.service")
@@ -336,6 +336,11 @@ class Session:
         self.last_audio_codec = "pcm-s16le"
         self._adpcm_turn = 0
         self._ending_turn: Optional[int] = None
+        # UDP 路径（第 3 段）：重排缓冲 + 自己的计数。_udp_used 决定
+        # 收轮时要不要等尾巴，别给 TCP 轮次平白加 120 ms。
+        self._udp = audio_udp.Reorder()
+        self._udp_used = False
+        self.udp_blocks = 0
         self._adpcm_seq: Optional[int] = None
         self._adpcm_blocks = 0
         self._adpcm_lost = 0
@@ -558,6 +563,31 @@ class Session:
         link.authed = True
         await link.send_json(pav1.KIND_HELLO, {"ok": True})
 
+    def on_udp_adpcm(self, turn_id: int, seq: int, payload: bytes) -> None:
+        """UDP 收到的 kind=5：先按 seq 重排，再交给 TCP 那条完全相同的解码路径。
+
+        重排好的每一包直接喂给 on_uplink_adpcm —— 它本来就把'seq 缺口'
+        算成丢失，所以 UDP 的丢包统计和 TCP 口径一致，不需要第二套账。
+        """
+        self._udp_used = True
+        if self._udp.expected == 0 and not self._udp.buf and seq != 0:
+            # 这一轮的起点：第一包就不是 0 说明前面真丢了，别为它永久等待。
+            self._udp.reset(seq)
+        for item in self._udp.push(seq, payload):
+            self.udp_blocks += 1
+            self.on_uplink_adpcm(turn_id, item)
+
+    def _udp_tail(self, turn_id: int) -> None:
+        """收轮前把重排缓冲吐干净。END 走 TCP，尾巴还在 UDP 路上。"""
+        rest = self._udp.flush()
+        for item in rest:
+            self.udp_blocks += 1
+            self.on_uplink_adpcm(turn_id, item)
+        if self._udp_used:
+            log.info("%s udp turn=%d blocks=%d %s tail=%d", self.device_id,
+                     turn_id, self.udp_blocks, self._udp.stats(), len(rest))
+        self._udp.reset(self._udp.expected)
+
     def on_uplink_adpcm(self, turn_id: int, payload: bytes) -> None:
         """kind=5：payload = [u32 seq][164 B IMA 块]。
 
@@ -639,6 +669,11 @@ class Session:
             # The audio stream is self-delimiting: PCM* END. The control-channel
             # event can arrive before, after, or interleaved with it, so the END
             # frame -- not the event -- is what closes the turn.
+            if self._udp_used:
+                # 等一个'尾巴'：END 从 TCP 来，最后几包 UDP 可能晚到 20–80 ms。
+                # 实测 RTT 205 ms，抖动远小于它；这个值可配。
+                await asyncio.sleep(self.cfg.udp_tail_ms / 1000.0)
+            self._udp_tail(turn_id)
             self._audio_end.set()
             log.info("%s audio END for turn %d (%d bytes buffered)", self.device_id,
                      turn_id, len(self._capture_buf))
@@ -1071,6 +1106,14 @@ class Service:
         self.control_port = cfg.control_port
         self.audio_port = cfg.audio_port
         self.audio_enabled = True
+        # UDP 打洞寄存器：源地址 -> 设备 id。设备永远主动打洞，所以这里
+        # 学到的地址就是回程地址，服务端不需要任何入站端口配置。
+        self._udp_addrs: Dict[tuple, str] = {}
+        self._udp_transport = None
+        self.udp_hello = 0
+        self.udp_datagrams = 0
+        self.udp_bad = 0
+        self.udp_errors = 0
         self._t0 = time.monotonic()
         self._servers: list[asyncio.AbstractServer] = []
         self._nonces: Dict[str, str] = {}
@@ -1115,6 +1158,36 @@ class Service:
         if not hmac.compare_digest(expected, str(mac_hex).lower()):
             raise PermissionError("hmac mismatch")
 
+    def on_udp_datagram(self, data: bytes, addr, transport) -> None:
+        """UDP 数据报入口。必须同步、必须快：慢了内核缓冲就被后面的包冲掉。"""
+        self.udp_datagrams += 1
+        try:
+            kind, turn, payload = audio_udp.parse(data)
+        except audio_udp.BadDatagram:
+            self.udp_bad += 1
+            return
+        if kind == audio_udp.KIND_HELLO:
+            dev = payload.decode("ascii", "replace").strip()
+            fresh = self._udp_addrs.get(addr) != dev
+            self._udp_addrs[addr] = dev
+            self.udp_hello += 1
+            transport.sendto(audio_udp.build(audio_udp.KIND_HELLO, 0), addr)
+            if fresh:
+                log.info("%s udp hello from %s:%d", dev, addr[0], addr[1])
+            return
+        dev = self._udp_addrs.get(addr)
+        if not dev:
+            # 没打过洞就发音频：当作坏包，不猜测来源。
+            self.udp_bad += 1
+            return
+        session = self.sessions.get(dev)
+        if session is None:
+            self.udp_bad += 1
+            return
+        if kind == audio_udp.KIND_ADPCM:
+            session.on_udp_adpcm(turn, int.from_bytes(payload[:4], "little"),
+                                 payload)
+
     # -- lifecycle ---------------------------------------------------------
     async def start(self) -> None:
         # Keep each server's own socket: reading self._servers[-1] after a later
@@ -1129,6 +1202,12 @@ class Service:
                 self._on_audio, self.cfg.host, self.cfg.audio_port)
             self._servers.append(audio_srv)
             self.audio_port = audio_srv.sockets[0].getsockname()[1]
+        if self.audio_enabled:
+            loop = asyncio.get_running_loop()
+            self._udp_transport, _ = await loop.create_datagram_endpoint(
+                lambda: audio_udp.DatagramProtocol(self),
+                local_addr=(self.cfg.host, self.audio_port))
+            log.info("audio udp on %s:%d", self.cfg.host, self.audio_port)
         if self.cfg.admin_port:
             self._servers.append(await asyncio.start_server(
                 self._on_admin, "127.0.0.1", self.cfg.admin_port))

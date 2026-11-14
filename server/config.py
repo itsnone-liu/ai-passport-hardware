@@ -42,6 +42,9 @@ class Config:
     host: str = "0.0.0.0"
     control_port: int = 18080
     audio_port: int = 18081
+    # 收轮时给 UDP 尾巴的等待（秒）。END 从 TCP 来，最后几包 UDP 可能
+    # 还在路上；120 ms 是实测抖动上界，再大就会明显拖慢回答。
+    udp_tail_ms: float = 120.0
     # device_id -> shared secret (bytes). Never the cardid: that identifies the
     # device to FoloToy, it does not authenticate it to us.
     devices: Dict[str, bytes] = field(default_factory=dict)
