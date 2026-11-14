@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from server import pav1
+from server import adpcm, pav1
 from server.config import Config
 
 log = logging.getLogger("passport.service")
@@ -258,6 +258,11 @@ class AudioLink:
                 await self.session.report_error("not_authed", "pcm before auth")
                 return
             self.session.on_uplink_pcm(frame.turn_id, frame.payload)
+        elif frame.kind == pav1.KIND_ADPCM:
+            if not self.authed:
+                await self.session.report_error("not_authed", "adpcm before auth")
+                return
+            self.session.on_uplink_adpcm(frame.turn_id, frame.payload)
         elif frame.kind == pav1.KIND_END:
             if not self.authed:
                 await self.session.report_error("not_authed", "end before auth")
@@ -322,6 +327,19 @@ class Session:
         self.probe_end_turn = 0
         self._probe_log_at = 0.0
         self.last_pre_roll_ms = -1
+        self.last_audio_codec = "pcm-s16le"
+        self._adpcm_turn = 0
+        self._adpcm_seq: Optional[int] = None
+        self._adpcm_blocks = 0
+        self._adpcm_lost = 0
+        self._adpcm_bad = 0
+        self.last_audio_codec = "pcm-s16le"
+        self._adpcm_turn = 0
+        self._ending_turn: Optional[int] = None
+        self._adpcm_seq: Optional[int] = None
+        self._adpcm_blocks = 0
+        self._adpcm_lost = 0
+        self._adpcm_bad = 0
         self.last_capture_frames = -1
         self.last_capture_dropped = -1
         self.last_rms = -1
@@ -442,6 +460,7 @@ class Session:
             # replay. Reporting a nominal 300 would make the server expect audio
             # that never existed.
             self.last_pre_roll_ms = int(msg.get("pre_roll_ms", -1))
+            self.last_audio_codec = str(msg.get("audio_codec", "pcm-s16le"))
             # The device owns turn ids: it can start a turn by itself on a key
             # press. Adopting its id is what makes those frames land in the
             # pipeline instead of being dropped as "no such turn" -- the bug that
@@ -461,8 +480,9 @@ class Session:
                 self.state = STATE_LISTENING
                 if self._capture_ended.is_set():
                     self._capture_ended = asyncio.Event()
-            log.info("%s capture.started turn=%s pre_roll_ms=%s", self.device_id,
-                     self.active_turn, self.last_pre_roll_ms)
+            log.info("%s capture.started turn=%s pre_roll_ms=%s codec=%s",
+                     self.device_id, self.active_turn, self.last_pre_roll_ms,
+                     self.last_audio_codec)
         elif ev == "capture.ended":
             self._last_capture_reason = str(msg.get("reason", "")) or "released"
             if "frames" in msg:
@@ -538,6 +558,30 @@ class Session:
         link.authed = True
         await link.send_json(pav1.KIND_HELLO, {"ok": True})
 
+    def on_uplink_adpcm(self, turn_id: int, payload: bytes) -> None:
+        """kind=5：payload = [u32 seq][164 B IMA 块]。
+
+        解成 PCM16 之后调用 on_uplink_pcm，走与 PCM 完全相同的路径——缓冲、
+        轮次判定、ASR 一行都不用改。这就是"只换体格式、不换骨架"的目的。
+        seq 用来算丢块/乱序：设备每轮从 0 起，所以换轮要重置基准。
+        """
+        try:
+            seq, block = adpcm.split_payload(payload)
+        except ValueError as exc:
+            self._adpcm_bad += 1
+            log.warning("%s bad adpcm payload: %s", self.device_id, exc)
+            return
+        if self._adpcm_turn != turn_id:
+            self._adpcm_turn = turn_id
+            self._adpcm_seq = None
+        if self._adpcm_seq is not None:
+            gap = (seq - self._adpcm_seq - 1) & 0xFFFFFFFF
+            if 0 < gap < 1000:
+                self._adpcm_lost += gap
+        self._adpcm_seq = seq
+        self._adpcm_blocks += 1
+        self.on_uplink_pcm(turn_id, adpcm.decode_block(block))
+
     def on_uplink_pcm(self, turn_id: int, payload: bytes) -> None:
         now = time.monotonic()
         if self.active_turn == turn_id and self.state == STATE_LISTENING:
@@ -582,6 +626,15 @@ class Session:
         self._capture_buf += payload
 
     async def on_uplink_end(self, turn_id: int) -> None:
+        if self._adpcm_blocks:
+            # 解码后的 RMS 要和设备 capture.ended 里的 rms 对得上：|Δ| 小说明
+            # 4:1 压缩+传输整条链没把音量弄丢，这是比帧计数更硬的证据。
+            log.info("%s adpcm turn=%s blocks=%d lost=%d bad=%d (%.2f s decoded, "
+                     "rms=%d)", self.device_id, self._adpcm_turn,
+                     self._adpcm_blocks, self._adpcm_lost, self._adpcm_bad,
+                     self._adpcm_blocks * adpcm.FRAME_MS / 1000.0,
+                     adpcm.pcm_rms(self._capture_buf))
+            self._adpcm_blocks = self._adpcm_lost = self._adpcm_bad = 0
         if self.active_turn == turn_id:
             # The audio stream is self-delimiting: PCM* END. The control-channel
             # event can arrive before, after, or interleaved with it, so the END
@@ -638,6 +691,7 @@ class Session:
         self._capture_ended = asyncio.Event()
         self._audio_end = asyncio.Event()
         self._cancel = asyncio.Event()
+        self._ending_turn = None
         log.info("%s capture.start turn=%d sent (audio_link=%s)", self.device_id,
                  self.active_turn, bool(self.audio and self.audio.authed))
         reply = await self._capture_start(self.active_turn)
@@ -697,6 +751,14 @@ class Session:
         """
         if self.state != STATE_LISTENING:
             return
+        # 一次轮次只允许一条收尾流水线。音频 END 和松手事件是两条独立的通道，
+        # on_uplink_end 与 on_key 会几乎同时调到这里；两条都往下走，第一条会把
+        # _capture_buf 拿走跑 ASR，第二条看到 0 字节，日志里就是那句
+        # "has only 0 bytes; skipping ASR"——看着像 ASR 没收到音频，其实是自己
+        # 把自己那一轮的缓冲清空了。
+        if self._ending_turn == self.active_turn:
+            return
+        self._ending_turn = self.active_turn
         if self._capture_task:
             self._capture_task.cancel()
             self._capture_task = None
@@ -747,14 +809,26 @@ class Session:
         self.metrics.append(m)
         pcm = bytes(self._capture_buf)
         self._capture_buf = bytearray()
+        log.info("%s turn %d pipeline start: %d bytes (reason=%s)",
+                 self.device_id, turn_id, len(pcm), reason)
         if len(pcm) < 3200:                     # < 0.1 s: not speech, not worth a call
             log.info("%s turn %d has only %d bytes; skipping ASR", self.device_id,
                      turn_id, len(pcm))
             await self._to_idle(turn_id)
             return
         try:
-            transcript = await self.service.asr.transcribe(pcm)
+            # 外面套一层超时：ASR 客户端自己虽然有 deadline，但它可能卡在
+            # websockets 握手/发送上（实测服务内那一步可以一直不返回，
+            # 日志停在 pipeline start 之后再无输出，整条流水线就此消失）。
+            # 单跑客户端 2.7 s 就出结果，所以超时上限给 30 s 足够宽松。
+            _asr_t0 = self.service.now_ms()
+            transcript = await asyncio.wait_for(
+                self.service.asr.transcribe(pcm),
+                getattr(self.cfg, "asr_timeout", 30.0))
             m.asr_ms = self.service.now_ms()
+            log.info("%s turn %d asr done in %d ms text=%r",
+                     self.device_id, turn_id,
+                     m.asr_ms - _asr_t0, transcript.text)
             m.text = transcript.text
             if not transcript.text:
                 await self.control.request("show_text", self.cfg.request_timeout,
