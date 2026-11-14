@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -42,7 +43,23 @@ static uint32_t s_dropped;
 static uint32_t s_overflows;
 static uint32_t s_turns;
 static uint32_t s_read_fail;
+static double s_sum_sq;
+static uint32_t s_samples;
+static int32_t s_peak;
 static char s_state[16] = "idle";
+
+// 上行携带的到底是不是真实声音？帧数对得上只说明边界没错，
+// 全零帧也能凑出正确的计数——所以统计这一轮的 RMS 与峰值。
+static void accumulate(const uint8_t *frame) {
+    const int16_t *p = (const int16_t *)frame;
+    for (int i = 0; i < FRAME_BYTES / 2; i++) {
+        const int32_t v = p[i];
+        s_sum_sq += (double)v * (double)v;
+        if (v > s_peak) s_peak = v;
+        if (-v > s_peak) s_peak = -v;
+    }
+    s_samples += FRAME_BYTES / 2;
+}
 
 static void set_state(const char *st) { snprintf(s_state, sizeof s_state, "%s", st); }
 
@@ -55,11 +72,13 @@ static void emit_capture_started(uint32_t turn_id, int pre_roll_ms) {
 }
 
 static void emit_capture_ended(uint32_t turn_id, const char *reason) {
-    char ev[192];
+    char ev[256];
+    const int rms = s_samples ? (int)(sqrt(s_sum_sq / (double)s_samples) + 0.5) : 0;
     snprintf(ev, sizeof ev,
              "{\"event\":\"capture.ended\",\"turn_id\":%u,\"reason\":\"%s\",\"frames\":%u,"
-             "\"dropped\":%u}\n",
-             (unsigned)turn_id, reason, (unsigned)s_sent_frames, (unsigned)s_dropped);
+             "\"dropped\":%u,\"rms\":%d,\"peak\":%d}\n",
+             (unsigned)turn_id, reason, (unsigned)s_sent_frames, (unsigned)s_dropped, rms,
+             (int)s_peak);
     terminal_link_send_src(LINK_SRC_TCP, ev);
     ESP_LOGI(TAG, "轮次 %u 结束：%s，%u 帧，丢 %u", (unsigned)turn_id, reason,
              (unsigned)s_sent_frames, (unsigned)s_dropped);
@@ -94,6 +113,9 @@ static void begin_turn(void) {
     s_turn_start_us = esp_timer_get_time();
     s_sent_frames = 0;
     s_dropped = 0;
+    s_sum_sq = 0;
+    s_samples = 0;
+    s_peak = 0;
     s_turns++;
     set_state("listening");
     flush_preroll();
@@ -155,6 +177,7 @@ static void capture_task(void *arg) {
             if (terminal_pav1_send_pcm(s_turn, frame, FRAME_BYTES) > 0) {
                 s_sent_frames++;
                 s_dropped = 0;
+                accumulate(frame);
             } else {
                 // 发不出去就是发不出去：计数，连续 500 ms 才判 overflow 并收轮，
                 // 偶发一帧丢弃不值得打断整轮对话。
@@ -227,10 +250,12 @@ void terminal_capture_get_audio(char *buf, size_t n) {
     const char *st = s_active ? "capturing" : (s_armed ? "armed" : s_state);
     snprintf(buf, n,
              "\"state\":\"%s\",\"turn_id\":%u,\"ring_ms\":0,\"underruns\":0,"
-             "\"overflows\":%u,\"frames\":%u,\"dropped\":%u,\"read_fail\":%u,\"turns\":%u",
+             "\"overflows\":%u,\"frames\":%u,\"dropped\":%u,\"read_fail\":%u,\"turns\":%u,"
+             "\"rms\":%d,\"peak\":%d",
              st, (unsigned)(s_active ? s_turn : 0), (unsigned)s_overflows,
              (unsigned)s_sent_frames, (unsigned)s_dropped, (unsigned)s_read_fail,
-             (unsigned)s_turns);
+             (unsigned)s_turns, s_samples ? (int)(sqrt(s_sum_sq / (double)s_samples) + 0.5) : 0,
+             (int)s_peak);
 }
 
 void terminal_capture_describe(char *buf, size_t n) {
