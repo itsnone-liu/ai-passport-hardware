@@ -99,3 +99,17 @@ factory,  app,  factory, 0x10000, 0x7f0000
 
 本项目仅用于**自有设备**的学习与研究。文中涉及的设备身份字段已全部脱敏；
 请勿将本仓库的方法用于未获授权的设备。固件镜像与 ELF 属于厂商版权内容，未包含在本仓库中。
+
+---
+
+## 语音链路工程状态（2026-11-14）
+
+硬件调研之外，本仓库现在还有一条**已验证的语音链路**：Passport → Ubuntu 服务端（控制 +
+音频双通道）→ ASR → dsh → TTS → 回放，`server/` 是服务端实现，`docs/voice-protocol-v1.md`
+是双方签认并冻结的协议。
+
+- 当前进度、实测数字、已修缺陷与待办：[`docs/status-2026-11-14.md`](docs/status-2026-11-14.md)
+- 协议正文：[`docs/voice-protocol-v1.md`](docs/voice-protocol-v1.md)
+- 服务端说明与运行方式：[`server/README.md`](server/README.md)
+
+> 未验证项只有一条：真人对设备说话、ASR 认出字——需要有人在设备旁边。
