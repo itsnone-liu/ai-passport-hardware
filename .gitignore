@@ -23,3 +23,7 @@ boot-*.txt
 # OS noise
 .DS_Store
 Thumbs.db
+
+# voice service secrets (Ubuntu side): per-device shared secrets, never committed
+server/config/devices/
+*.secret
