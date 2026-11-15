@@ -108,6 +108,7 @@ class BridgeBrain:
         started = time.monotonic()
         buf = ""
         step_buf = ""
+        last_content = ""
         spent_short_line = False
         first_seen = False
         finished = False
@@ -144,6 +145,8 @@ class BridgeBrain:
                     # the conclusion needs.
                     text = step_buf.strip()
                     step_buf = ""
+                    if text and len(text) > self.short_step_chars:
+                        last_content = text      # fallback if the last step is silent
                     if text and not spent_short_line and len(text) <= self.short_step_chars:
                         spent_short_line = True
                         for piece in split_sentences(text + "。" )[0]:
@@ -153,7 +156,11 @@ class BridgeBrain:
                     step_buf += str(msg.get("text") or "")
                 elif kind == "done":
                     finished = True
-                    final_text = step_buf.strip()
+                    # The last step is normally the conclusion; if it carried no
+                    # text (a trailing tool call, say), fall back to the most
+                    # recent step that did -- better the previous conclusion
+                    # than silence after a promise.
+                    final_text = step_buf.strip() or last_content
                     sentences, rest = split_sentences(final_text)
                     for piece in sentences:
                         yield piece

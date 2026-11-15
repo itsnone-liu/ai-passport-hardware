@@ -204,3 +204,14 @@ class TestBridgeBrain(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+    async def test_silent_final_step_falls_back_to_the_last_answer(self):
+        """A trailing tool-only step must not swallow the conclusion."""
+        self.fake.script = [
+            {"type": "step"},
+            {"type": "delta", "text": "汤圆还剩四十九个 G，比米线宽裕得多。"},
+            {"type": "step"},                       # last step: no text at all
+            {"type": "done", "cancelled": False},
+        ]
+        got = [s async for s in self.brain.astream("汤圆磁盘")]
+        self.assertIn("四十九", "".join(got), f"conclusion lost: {got!r}")
