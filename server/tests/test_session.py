@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import json
 import os
 import sys
@@ -775,5 +776,39 @@ class TestSilenceHold(unittest.IsolatedAsyncioTestCase):
         self.assertIn("答案来了", _spoken(svc), "the slow answer never reached the speaker")
         self.assertEqual(dev.underruns, 0,
                          "playback died while the brain was still working")
+        await dev.close()
+        await svc.stop()
+
+
+class TestTruncation(unittest.IsolatedAsyncioTestCase):
+    """When the read-aloud budget runs out, the closing line must still be said.
+
+    Observed: a long answer was cut at 198 characters, the promised "后面我放屏幕
+    上了" was never spoken (it went through the same exhausted budget), the agent
+    kept writing into a stream nobody could hear, and the device underran before
+    END ever arrived.
+    """
+
+    async def test_closing_note_is_spoken_and_stream_ends_early(self):
+        class LongBrain:
+            name = "long"
+
+            async def ask(self, text, session="passport"):
+                yield "这是一句很长的话，会长到超过预算。" * 12   # ~216 chars
+                await asyncio.sleep(0.5)                     # agent still "thinking"
+                yield "这段本来也该被丢弃。"
+
+        svc = await make_service(speak_max_seconds=5.0, hold_max_seconds=0)
+        svc.brain = LongBrain()
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        t0 = time.monotonic()
+        await dev.converse(tone(0.2, 220))
+        elapsed = time.monotonic() - t0
+        spoken = _spoken(svc)
+        self.assertIn("屏幕", spoken, f"closing line missing from what was said: {spoken!r}")
+        self.assertNotIn("本来也该被丢弃", spoken)
+        self.assertLess(elapsed, 3.0,
+                        "the turn waited for the rest of the answer instead of ending")
         await dev.close()
         await svc.stop()

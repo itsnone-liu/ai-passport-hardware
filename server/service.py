@@ -909,9 +909,12 @@ class Session:
                 said = (m.overflow or "") if m.overflow else (
                     m.text if isinstance(m.text, str) and len(m.text) > 80 else "")
                 if len(said) > 0 and self.control and not self.control.closed:
-                    await asyncio.wait_for(
-                        self.control.request("show_text", 1.0, text=said[:220]),
+                    reply = await asyncio.wait_for(
+                        self.control.request("show_text", 1.0, text=said[:400]),
                         timeout=1.5)
+                    log.info("%s turn %d screen updated: %s (%d chars)",
+                             self.device_id, turn_id,
+                             "ok" if (reply or {}).get("ok") else f"FAILED {reply}", len(said[:400]))
         except asyncio.CancelledError:
             raise
         except Exception as exc:                       # noqa: BLE001 - report, don't die
@@ -1001,12 +1004,26 @@ class Session:
                     await flush(text)
                     if self._cancel.is_set():
                         return
+                    if budget.exhausted:
+                        # Everything further would be dropped anyway; ending the
+                        # stream now keeps the device from starving while the
+                        # agent keeps writing to nobody.
+                        log.info("%s turn %d speech budget exhausted; ending stream",
+                                 self.device_id, turn_id)
+                        break
                 if buf.strip():
                     await flush(buf)
                 if budget.truncated:
                     note = budget.tail_note()
                     if note:
-                        await flush(note)
+                        # Spoken verbatim: routing it through the budget (which
+                        # is exhausted by definition here) is exactly how the
+                        # closing line went missing.
+                        said.append(note)
+                        async for audio in self.service.tts.stream(note):
+                            if self._cancel.is_set():
+                                return
+                            await queue.put(audio)
                 m.spoken = "".join(said)
                 if budget.truncated:
                     m.overflow = budget.overflow

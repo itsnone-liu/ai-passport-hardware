@@ -100,7 +100,11 @@ class Config:
     #: How long silence may be streamed to keep playback open while the agent
     #: is still working. The device ends playback after 500 ms of no data
     #: (audio_underrun), so a 1.6 s ack cannot bridge a 60 s think.
-    hold_max_seconds: float = 20.0
+    hold_max_seconds: float = 90.0
+    #: Send playback.stop + state.set idle right after a device authenticates.
+    #: Newer than the firmware in the field: it has not been shown to be safe on
+    #: real hardware yet, so it is off until the device proves it tolerates it.
+    reset_on_auth: bool = False
 
     # Dev-only: count PAV1 PCM frames that do not belong to a turn, so firmware
     # can prove frame boundaries end to end (vendor.uplink_test) before
