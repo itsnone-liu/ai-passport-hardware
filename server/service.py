@@ -1811,10 +1811,16 @@ class Service:
             # from the payload, which is exactly how the first HELLO was lost.
             head: Optional[pav1.Frame] = None
             rest: list[pav1.Frame] = []
+            hello_bytes = 0
             deadline = asyncio.get_running_loop().time() + self.cfg.hello_timeout
             while head is None:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
+                    # A half-sent HELLO looks exactly like a healthy connection
+                    # from the peer's side; without this line the server side is
+                    # silent about it (measured: 16 of 137 bytes, then nothing).
+                    log.warning("audio hello timeout after %d bytes (incomplete frame)",
+                                hello_bytes)
                     reply("timeout")
                     await writer.drain()
                     writer.close()
@@ -1826,8 +1832,10 @@ class Service:
                     await writer.drain()
                     writer.close()
                     return
+                hello_bytes += len(chunk)
                 if not chunk:
-                    writer.close()          # peer left before saying anything
+                    log.info("audio peer closed before HELLO (%d bytes)", hello_bytes)
+                    writer.close()
                     return
                 try:
                     frames = framer.feed(chunk)
