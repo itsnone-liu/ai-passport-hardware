@@ -27,7 +27,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from server import adpcm, audio_udp, pav1
+from server import adpcm
+from server import speech as speech_text, audio_udp, pav1
 from server.config import Config
 
 log = logging.getLogger("passport.service")
@@ -64,6 +65,7 @@ def tune_socket(writer: asyncio.StreamWriter) -> None:
 # 合成粒度：攒到句末标点或这么多字再请求 TTS。
 # 太小 → 请求次数多、每次都吃固定开销，播放端 starving；
 # 太大 → 首句出声变慢。48 字约等于 4~6 秒音频。
+ACK_NOTE = "（ack）"
 TTS_FLUSH_CHARS = 48
 TTS_SENTENCE_END = "。！？!?…；;\n"
 
@@ -88,6 +90,8 @@ class TurnMetrics:
     upload_bytes: int = 0
     downlink_bytes: int = 0
     text: str = ""
+    spoken: str = ""            # what was actually read aloud (cleaned+truncated)
+    overflow: str = ""          # the part that went to the screen instead
 
     def as_dict(self) -> Dict[str, Any]:
         def delta(a: Optional[int], b: Optional[int]) -> Optional[int]:
@@ -899,11 +903,12 @@ class Session:
             # "stop playback" instead of "start capture" (caught by the 20-turn
             # regression, which is what these tests are for).
             with contextlib.suppress(Exception):
-                said = m.text if isinstance(m.text, str) else ""
-                # Only when it is worth reading: short replies were already
-                # spoken, and mirroring them just fights the ASR echo on screen.
-                # A short budget keeps a dead link from costing 5 s per turn.
-                if len(said) > 80 and self.control and not self.control.closed:
+                # Prefer the overflow: the screen is where the words that did
+                # not fit belong. Fall back to the whole text for long replies
+                # that were spoken without truncation.
+                said = (m.overflow or "") if m.overflow else (
+                    m.text if isinstance(m.text, str) and len(m.text) > 80 else "")
+                if len(said) > 0 and self.control and not self.control.closed:
                     await asyncio.wait_for(
                         self.control.request("show_text", 1.0, text=said[:220]),
                         timeout=1.5)
@@ -947,16 +952,34 @@ class Session:
 
         async def produce() -> None:
             buf = ""
+            in_fence = False
+            budget = speech_text.SpeechBudget(self.cfg.speak_max_seconds)
+            said: list[str] = []
 
-            async def flush(text: str) -> None:
-                if not text.strip():
+            async def flush(raw: str) -> None:
+                nonlocal in_fence
+                if not raw.strip():
                     return
-                async for audio in self.service.tts.stream(text):
+                cleaned, in_fence = speech_text.clean_for_speech(raw, in_fence=in_fence)
+                if not cleaned.strip():
+                    return
+                speakable = budget.take(cleaned)
+                if not speakable.strip():
+                    return
+                said.append(speakable)
+                async for audio in self.service.tts.stream(speakable):
                     if self._cancel.is_set():
                         return
                     await queue.put(audio)
 
             try:
+                ack = self.service.ack_pcm
+                if ack:
+                    # The gap between "user stopped talking" and "first agent
+                    # text" measured 12 s; the ack is pre-synthesised, so the
+                    # device starts speaking without waiting for the model.
+                    said.append(ACK_NOTE)
+                    await queue.put(ack)
                 log.info("%s speak: asking brain for turn %d", self.device_id, turn_id)
                 async for chunk in self.service.brain.ask(m.text,
                                                           session=self.service.dsh_session):
@@ -979,6 +1002,16 @@ class Session:
                         return
                 if buf.strip():
                     await flush(buf)
+                if budget.truncated:
+                    note = budget.tail_note()
+                    if note:
+                        await flush(note)
+                m.spoken = "".join(said)
+                if budget.truncated:
+                    m.overflow = budget.overflow
+                    log.info("%s turn %d speech truncated at %d chars; %d chars overflow",
+                             self.device_id, turn_id, budget.spoken_chars,
+                             len(budget.overflow))
             except Exception as exc:                       # noqa: BLE001
                 log.exception("synthesis failed")
                 await queue.put(exc)
@@ -1417,10 +1450,33 @@ class Service:
         if self.cfg.admin_port:
             self._servers.append(await asyncio.start_server(
                 self._on_admin, "127.0.0.1", self.cfg.admin_port))
+        self.ack_pcm = b""
+        if self.cfg.ack_enabled and self.cfg.ack_text:
+            asyncio.create_task(self._prepare_ack())
         if self.cfg.audio_revive_after > 0:
             self._revive_task = asyncio.create_task(self._audio_revive_loop())
         log.info("control on %s:%d audio on %s:%d", self.cfg.host, self.control_port,
                  self.cfg.host, self.audio_port)
+
+    async def _reset_device_state(self) -> None:
+        """Put a freshly connected device back to idle, whatever it was doing."""
+        try:
+            await asyncio.sleep(0.2)
+            await self.control.request("playback.stop", 2.0, turn_id=0)
+        except Exception:                                  # noqa: BLE001
+            pass
+        with contextlib.suppress(Exception):
+            await self.control.request("state.set", 2.0, state="idle", turn_id=0)
+
+    async def _prepare_ack(self) -> None:
+        """Synthesise the filler line once, so it costs nothing per turn."""
+        try:
+            chunks = [c async for c in self.tts.stream(self.cfg.ack_text)]
+            self.ack_pcm = b"".join(chunks)
+            log.info("ack ready: %d bytes for %r", len(self.ack_pcm), self.cfg.ack_text)
+        except Exception:                                  # noqa: BLE001
+            log.warning("ack synthesis failed; turns will start with silence")
+            self.ack_pcm = b""
 
     async def _audio_revive_loop(self) -> None:
         """Nudge the device to re-dial its audio channel after a silent drop.

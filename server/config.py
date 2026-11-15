@@ -89,6 +89,15 @@ class Config:
     # server nudges the device; 0 disables the watchdog.
     audio_revive_after: float = 6.0
 
+    # --- speech shaping -------------------------------------------------
+    #: Read at most this many seconds of a reply; the rest goes to the screen.
+    speak_max_seconds: float = 45.0
+    #: Pre-synthesised line played the moment the brain is asked (it covers the
+    #: 10-15 s the agent spends running tools before it writes anything).
+    ack_text: str = "嗯，我看一下。"
+    #: The device reports this much audio already played when ack is on.
+    ack_enabled: bool = True
+
     # Dev-only: count PAV1 PCM frames that do not belong to a turn, so firmware
     # can prove frame boundaries end to end (vendor.uplink_test) before
     # capture.start exists. Counted, never played, never fed to ASR.
