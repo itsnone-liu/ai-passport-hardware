@@ -1225,9 +1225,17 @@ class Session:
             await self.audio.send_frame(pav1.KIND_END, turn_id)
             log.info("%s downlink done: %d bytes, worst send block %.0f ms",
                      self.device_id, m.downlink_bytes, self._max_send_block * 1000)
-            with contextlib.suppress(asyncio.TimeoutError):
+            try:
                 await asyncio.wait_for(self._played_end.wait(),
                                        self.cfg.playback_tail_timeout)
+            except asyncio.TimeoutError:
+                # The device owed us playback.ended and never sent it (usually
+                # because it had already underrun). Say so -- a silent timeout
+                # here is what leaves the screen stuck on `speaking`.
+                log.warning("%s turn %d: no playback.ended within %.0fs "
+                            "(last reason %r); forcing idle",
+                            self.device_id, turn_id, self.cfg.playback_tail_timeout,
+                            self._last_end_reason)
             m.cancelled = self._last_end_reason == "cancelled"
             await self._to_idle(turn_id)
         finally:
@@ -1388,9 +1396,15 @@ class Session:
         self.state = STATE_IDLE
         self.active_turn = None
         if self.control and not self.control.closed:
-            with contextlib.suppress(Exception):
-                await self.control.request("state.set", self.cfg.request_timeout,
-                                           state=STATE_IDLE, turn_id=turn_id)
+            try:
+                reply = await self.control.request("state.set", self.cfg.request_timeout,
+                                                   state=STATE_IDLE, turn_id=turn_id)
+                ok = (reply or {}).get("ok")
+                log.info("%s turn %d -> idle (state.set %s)",
+                         self.device_id, turn_id, "ok" if ok else f"FAILED {reply}")
+            except Exception as exc:                  # noqa: BLE001
+                log.warning("%s turn %d -> idle locally, state.set failed: %s",
+                            self.device_id, turn_id, exc)
 
     # -- host-facing API ---------------------------------------------------
     async def show_text(self, text: str) -> Dict[str, Any]:
