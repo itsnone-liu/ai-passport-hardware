@@ -267,3 +267,46 @@ InvalidParameter: Please ensure input text is valid.`，随后设备报
 这套组合会让一次误按键看起来像"服务端启动了、设备没采"，两边日志都不报错。
 真正该修的是：**服务端只对 OK 键发 capture.start**，设备端对未 arm 的
 capture.start 要么起来要么明确拒绝，不能两者都不做。
+
+## §9 换网：手机热点（移动 5G）通过，并发现两个问题
+
+现场把设备从家里 Wi-Fi 换到手机热点，链路照常工作：
+
+| 指标 | 值 |
+|---|---|
+| 采集 | 156 帧 / 3.12 s，`dropped=0`、`rms=4139` |
+| 上行 | `lost=0`、`reordered=4`（移动网络乱序更明显） |
+| ASR | 3031 ms，`text='测试一下手机热点连接。'` 正确 |
+| 下行 | 316800 bytes = 495 帧，`played=495` |
+| 播放 | `underruns=0`、`overflows=0`、`starved=0` |
+| 丢包 | `udp_gap=0`、`udp_recovered=1` |
+| 源 IP | 家里 `117.94.180.245` → 移动 `223.104.152.153` |
+
+换网方式：串口发 `{"cmd":"set_net","ssid":"...","password":"..."}`
+（`host`/`port` 不传则保留原值）。回执先回、随后断链重连，所以回执收到即参数已落盘。
+
+### 问题一：找不到 AP 时设备 84 秒崩一次（不是固件 bug，是热点没开）
+
+热点关掉后设备进入 `reason=201`（`WIFI_REASON_NO_AP_FOUND`）循环：每 2.4 s
+重试 → 60 s 无 IP 强制重关联 → 84 s 左右 `reset=panic` 重启，`uptime` 与
+`prev_uptime` 都停在 84/85 秒。热点一开，循环立刻停止（`uptime=267`）。
+
+现场的坑：**SSID 大小写必须完全一致**。手机热点实际叫 `vivo S16 Pro`，
+按 `vivo s16` 配置就是 201，日志里看不出"名字写错了"，只有两种情况来回切才暴露。
+
+### 问题二：`get_net` 会把 dsh_usb 任务的栈打爆（真 bug，待修）
+
+每次发 `get_net`，设备打印 `***ERROR*** A stack overflow in task dsh_usb` 并重启
+（`reset=panic`）。`dsh_usb` 任务栈 4096 B（`terminal_proto.c:90`）；
+`get_net` 分支在栈上有 `char body[768]`，`terminal_net_describe()` 里又有
+`ssid[198] + host[390] = 588`，加上 cJSON 与 printf 的帧，超了。
+`terminal_link.c:74` 的注释已经记过一次同类事故（2048 字节栈帧打爆 4 KB）。
+
+修法（择一或并用）：
+1. `proto_task` 栈 4096 → 8192（最省事，+4 KB RAM，当前堆有 36 KB 余量）
+2. `get_net` 的 `body[768]` 改 static（注意 `handle_line` 若被 TCP 与 USB 两任务
+   共用，static 需要加锁，否则两个任务会互踩）
+
+影响面：**日常使用（按键说话）完全不经过这条路径**，所以不影响实际对话；
+只有主机侧诊断读 `get_net` 才会触发。`set_net`、`get_audio`、`get_status`
+均正常。
