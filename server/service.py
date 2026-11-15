@@ -958,9 +958,19 @@ class Session:
         m.overflow = text
         log.info("%s late answer for turn %d: %d chars", self.device_id, turn_id, len(text))
         try:
+            # The previous playback is usually still draining when the answer
+            # lands (measured: 0.6 s apart), so "busy" here is a race, not a
+            # refusal -- wait for the speaker to finish before talking.
+            for _ in range(40):                       # up to ~8 s
+                if self.state == STATE_IDLE:
+                    break
+                await asyncio.sleep(0.2)
             if self.state == STATE_IDLE:
+                log.info("%s speaking the late answer for turn %d", self.device_id, turn_id)
                 await self.speak_notification(text)
             else:
+                log.warning("%s still busy; late answer goes to the screen only",
+                            self.device_id)
                 with contextlib.suppress(Exception):
                     await self.control.request("show_text", 2.0, text=text[:400])
         except Exception:                              # noqa: BLE001

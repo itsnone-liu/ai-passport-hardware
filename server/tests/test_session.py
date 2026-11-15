@@ -12,6 +12,11 @@ import asyncio
 import contextlib
 import time
 from types import SimpleNamespace
+
+
+def SessionMetrics():
+    from server.service import TurnMetrics
+    return TurnMetrics(turn_id=1)
 import json
 import os
 import sys
@@ -871,5 +876,33 @@ class TestNotificationIsVerbatim(unittest.IsolatedAsyncioTestCase):
         self.assertIn("四十九个 G", spoken)
         # the mock brain answers with its own line; that answer must NOT appear
         self.assertNotIn("现在几点了", spoken)
+        await dev.close()
+        await svc.stop()
+
+
+class TestLateDeliveryWhileBusy(unittest.IsolatedAsyncioTestCase):
+    """The answer lands while the handoff line is still playing.
+
+    Measured 0.6 s apart: the notification was refused as busy and only reached
+    the screen, so the assistant promised a report and then said nothing.
+    """
+
+    async def test_late_answer_waits_for_the_speaker_to_finish(self):
+        from server.service import TurnMetrics
+
+        svc = await make_service()
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        session = svc.session_of(DEVICE)
+        session.state = "speaking"                     # previous line still playing
+        asyncio.get_running_loop().call_later(1.0, lambda: setattr(session, "state", "idle"))
+
+        q: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
+        q.put_nowait("还剩四十一 G。")
+        q.put_nowait(sentinel)
+        await session._deliver_late(1, q, sentinel, TurnMetrics(turn_id=1))
+        await asyncio.sleep(0.5)
+        self.assertIn("四十一", _spoken(svc), "the late answer never got spoken")
         await dev.close()
         await svc.stop()
