@@ -234,3 +234,36 @@ InvalidParameter: Please ensure input text is valid.`，随后设备报
 修法两处：服务端跳过空白 chunk；TTS 侧对空文本直接返回不消耗请求。
 
 这也修正了此前"`underruns=1` 可能是 prebuffer 差一点"的猜测——不是。
+
+## §8 完整闭环通过（真人语音 + 真 LLM + 双向 UDP）
+
+用户第三句：「今天是星期天，明天是星期一，要上班。」
+
+| 环节 | 实测 |
+|---|---|
+| 采集 | `frames=254 dropped=0`（5.08 s）、`rms=2165`、`peak=20657` |
+| 上行 | `blocks=254 lost=0 bad=0`、`reordered=2 gaps=0` |
+| **ASR** | **`asr done in 3691 ms text='今天是星期天，明天是星期一，要上班。'`** |
+| 回答 | DeepSeek（`bailian-llm`），用户确认"做了正确的回答" |
+| 下行 | `first downlink frame via udp`、`160000 bytes` = 250 帧 |
+| 播放 | `played=249`、`underruns=0`、`overflows=0` |
+| **停顿** | **`starved=0`**、`ahead` 全程稳定 **+0.37 s**（`lead 0.35s`） |
+
+这四项此前从未同时成立：§4 只有 ASR 通、回放走 TCP；§5 接了真 LLM 但还没跑真人；
+§6 下行切了 UDP；§7 才把停顿修掉。这一轮四者全绿。
+
+### 本轮出现的真实网络事件
+
+`udp_gap=1`、`udp_recovered=31(+3)`：下行确实丢了块并触发了一次跳窗，由 FEC 补回。
+也就是说**链路不是零丢包**，是"丢了但补上了"。这比"gaps=0"更接近真实使用条件。
+
+### 一次静默失败，原因已定位
+
+中间有一次按键服务端收到 `key press`、回了 `capture.start ok`，但设备一帧没发
+（`turns` 不增、`udp_sent` 不动、无 `capture.ended`）。用户重按后立刻正常。
+判断是**按到了上/下键**：服务端对任何按键都会发 `capture.start`，而设备端
+`terminal_capture_start()` 不校验 s_armed，于是"回复 ok、随后什么都没发生"。
+
+这套组合会让一次误按键看起来像"服务端启动了、设备没采"，两边日志都不报错。
+真正该修的是：**服务端只对 OK 键发 capture.start**，设备端对未 arm 的
+capture.start 要么起来要么明确拒绝，不能两者都不做。
