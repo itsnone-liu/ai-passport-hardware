@@ -1045,9 +1045,20 @@ class Session:
 
         async def hold_open() -> None:
             silence = b"\x00" * 640                     # one 20 ms frame
-            deadline = time.monotonic() + self.cfg.hold_max_seconds
+            started = time.monotonic()
+            deadline = started + self.cfg.hold_max_seconds
+            next_reminder = started + self.cfg.hold_reminder_seconds
             while not first_text.is_set() and not self._cancel.is_set():
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if self.service.wait_pcm and now >= next_reminder:
+                    # Say something: the device stays alive either way, but a
+                    # silent minute reads as "it forgot me".
+                    next_reminder = now + self.cfg.hold_reminder_seconds
+                    await queue.put(self.service.wait_pcm)
+                    # let the ring drain before resuming silence
+                    await asyncio.sleep(len(self.service.wait_pcm) / 32000)
+                    continue
+                if now >= deadline:
                     log.warning("%s hold expired after %.0fs with no text; "
                                 "the answer will land on screen only",
                                 self.device_id, self.cfg.hold_max_seconds)
@@ -1492,8 +1503,11 @@ class Service:
             self._servers.append(await asyncio.start_server(
                 self._on_admin, "127.0.0.1", self.cfg.admin_port))
         self.ack_pcm = b""
+        self.wait_pcm = b""
         if self.cfg.ack_enabled and self.cfg.ack_text:
             asyncio.create_task(self._prepare_ack())
+        if self.cfg.hold_reminder_text:
+            asyncio.create_task(self._prepare_wait())
         if self.cfg.audio_revive_after > 0:
             self._revive_task = asyncio.create_task(self._audio_revive_loop())
         log.info("control on %s:%d audio on %s:%d", self.cfg.host, self.control_port,
@@ -1518,6 +1532,16 @@ class Service:
         except Exception:                                  # noqa: BLE001
             log.warning("ack synthesis failed; turns will start with silence")
             self.ack_pcm = b""
+
+    async def _prepare_wait(self) -> None:
+        try:
+            chunks = [c async for c in self.tts.stream(self.cfg.hold_reminder_text)]
+            self.wait_pcm = b"".join(chunks)
+            log.info("wait line ready: %d bytes for %r",
+                     len(self.wait_pcm), self.cfg.hold_reminder_text)
+        except Exception:                                  # noqa: BLE001
+            log.warning("wait-line synthesis failed; holds will be silent")
+            self.wait_pcm = b""
 
     async def _audio_revive_loop(self) -> None:
         """Nudge the device to re-dial its audio channel after a silent drop.
