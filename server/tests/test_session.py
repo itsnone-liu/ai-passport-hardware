@@ -850,3 +850,26 @@ class TestLongTask(unittest.IsolatedAsyncioTestCase):
                         f"late answer never delivered: {texts}")
         await dev.close()
         await svc.stop()
+
+
+class TestNotificationIsVerbatim(unittest.IsolatedAsyncioTestCase):
+    """A notification must be read out, not answered.
+
+    Observed on the device: the long-task announcement was spoken, then the late
+    delivery was re-sent to the model, so the speaker read the model's *reply to
+    the announcement* instead of the answer it had promised.
+    """
+
+    async def test_notification_text_is_spoken_unchanged(self):
+        svc = await make_service()
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        session = svc.session_of(DEVICE)
+        await session.speak_notification("查到了，硬盘还剩四十九个 G。")
+        await asyncio.sleep(0.6)
+        spoken = _spoken(svc)
+        self.assertIn("四十九个 G", spoken)
+        # the mock brain answers with its own line; that answer must NOT appear
+        self.assertNotIn("现在几点了", spoken)
+        await dev.close()
+        await svc.stop()

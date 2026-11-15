@@ -966,7 +966,7 @@ class Session:
         except Exception:                              # noqa: BLE001
             log.exception("late delivery failed")
 
-    async def _speak(self, turn_id: int, m: TurnMetrics) -> None:
+    async def _speak(self, turn_id: int, m: TurnMetrics, verbatim: bool = False) -> None:
         """Stream a reply: start synthesising first, announce playback second.
 
         Order matters for the device. Sending playback.start and only then
@@ -1016,6 +1016,18 @@ class Session:
                     # device starts speaking without waiting for the model.
                     said.append(self.cfg.ack_text)   # metrics say what was heard
                     await queue.put(ack)
+                if verbatim:
+                    # A notification is text we already decided to say. Sending it
+                    # back through the brain made the device speak the model's
+                    # *reply* to the announcement instead of the announcement.
+                    log.info("%s speak: verbatim notification for turn %d (%d chars)",
+                             self.device_id, turn_id, len(m.text or ""))
+                    await flush(m.text or "")
+                    if buf.strip():
+                        await flush(buf)
+                    m.spoken = "".join(said)
+                    await queue.put(producer_done)
+                    return
                 log.info("%s speak: asking brain for turn %d", self.device_id, turn_id)
                 agen = self.service.brain.ask(m.text, session=self.service.dsh_session)
                 brain_q: asyncio.Queue = asyncio.Queue()
@@ -1420,7 +1432,7 @@ class Session:
         try:
             m.text = text
             m.asr_ms = m.dsh_first_ms = self.service.now_ms()
-            await self._speak(turn_id, m)
+            await self._speak(turn_id, m, verbatim=True)
         except Exception as exc:                       # noqa: BLE001
             log.exception("notification failed")
             await self.report_error("internal", str(exc))
