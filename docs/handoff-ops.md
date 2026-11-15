@@ -118,3 +118,29 @@ PASSPORT_DSH_SMOKE=1 DEEPSEEK_API_KEY=$(grep -m1 -oP 'DEEPSEEK_API_KEY="?\K[^"]+
 - 设备连不上：`systemctl restart passport-voice`；仍不行则让设备重启（它会从 `boot` 计数器自证）。
 - 仓库回滚：`/root/dsh-ws/ai-passport-hardware-20261114-f141a3e.bundle`（完整历史，可离线还原）。
 - 固件回滚：**不在这台机器上做**，按 Windows 侧的 8 MB 备份流程走。
+
+---
+
+## 8. 语音入口（P2，2026-11-15）
+
+设备的一轮现在可以落到**和打字同一个会话**里：
+
+```
+按键说话 → ASR → server/dsh/bridge.py → (unix socket) → dsh-feishu → 同一个 dsh session
+        ← 逐句文本 ← text-delta ←
+```
+
+| 项 | 值 |
+|---|---|
+| socket | `/root/.dsh/feishu/voice.sock`（桥创建，0600） |
+| 桥侧模块 | `dsh-feishu/src/voice_in.js`（`config.voice.enabled` 控制，默认关） |
+| 语音侧适配器 | `server/dsh/bridge.py`（`--brain bridge`） |
+| 只读自检 | `python3 -m server.tools.voice_probe ping` |
+| 真实问一句 | `python3 -m server.tools.voice_probe ask "你好"` |
+
+**切换顺序不能反**：先让桥带上新代码重启（飞书 `/restart`），确认
+`python3 -m server.tools.voice_probe ping` 返回 `pong`，再把语音服务的 `brain` 从
+`mock` 改成 `bridge` 并 `systemctl restart passport-voice`。反过来会出现"设备每轮都听到
+'语音入口暂时不可用'"。
+
+失败时的行为（已实现）：桥不可达 → 设备播报"语音入口暂时不可用，稍后再试"，而不是沉默。

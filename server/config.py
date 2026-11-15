@@ -68,6 +68,9 @@ class Config:
     dsh_token: str = ""
     dsh_session: str = "passport"
     # One-shot CLI brain (documented entry point, but a process per turn).
+    # Feishu-bridge voice socket (brain == "bridge"): spoken turns land in the
+    # same session the user types into.
+    bridge_socket: str = "/root/.dsh/feishu/voice.sock"
     dsh_binary: str = "dsh"
     dsh_profile: str = "headless"
 

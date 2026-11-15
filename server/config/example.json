@@ -9,6 +9,7 @@
   "asr": "bailian",
   "tts": "bailian",
   "brain": "mock",
+  "bridge_socket": "/root/.dsh/feishu/voice.sock",
   "bailian_base_url": "https://token-plan.cn-beijing.maas.aliyuncs.com",
   "bailian_asr_model": "qwen-audio-3.0-realtime-plus",
   "bailian_tts_model": "qwen-audio-3.0-tts-plus",

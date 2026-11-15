@@ -893,11 +893,34 @@ class Session:
             await self.control.request("show_text", self.cfg.request_timeout,
                                        text=transcript.text)
             await self._speak(turn_id, m)
+            # Long answers cannot be spoken in full; the screen is the overflow.
+            # Mirrored *after* the turn went idle on purpose: an extra round trip
+            # inside the speaking window makes the next keypress look like
+            # "stop playback" instead of "start capture" (caught by the 20-turn
+            # regression, which is what these tests are for).
+            with contextlib.suppress(Exception):
+                said = m.text if isinstance(m.text, str) else ""
+                # Only when it is worth reading: short replies were already
+                # spoken, and mirroring them just fights the ASR echo on screen.
+                # A short budget keeps a dead link from costing 5 s per turn.
+                if len(said) > 80 and self.control and not self.control.closed:
+                    await asyncio.wait_for(
+                        self.control.request("show_text", 1.0, text=said[:220]),
+                        timeout=1.5)
         except asyncio.CancelledError:
             raise
         except Exception as exc:                       # noqa: BLE001 - report, don't die
             log.exception("turn %s failed", turn_id)
             await self.report_error("internal", str(exc))
+            # If the brain is the thing that failed, say so out loud: a device
+            # that hears nothing is indistinguishable from a device that is off.
+            from server.dsh.bridge import BrainUnavailable
+            if isinstance(exc, BrainUnavailable):
+                try:
+                    m.text = "语音入口暂时不可用，稍后再试"
+                    await self._speak(turn_id, m)
+                except Exception:                      # noqa: BLE001
+                    log.exception("apology playback failed")
             await self._to_idle(turn_id)
         finally:
             m.done_ms = self.service.now_ms()
