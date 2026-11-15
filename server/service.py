@@ -345,6 +345,7 @@ class Session:
         # UDP 路径（第 3 段）：重排缓冲 + 自己的计数。_udp_used 决定
         # 收轮时要不要等尾巴，别给 TCP 轮次平白加 120 ms。
         self._udp = audio_udp.Reorder()
+        self._udp_turn: Optional[int] = None
         self._udp_used = False
         # downlink: after hole punching the server knows the device's UDP addr,
         # so playback goes there; before that it stays on this TCP unchanged.
@@ -583,9 +584,14 @@ class Session:
         算成丢失，所以 UDP 的丢包统计和 TCP 口径一致，不需要第二套账。
         """
         self._udp_used = True
-        if self._udp.expected == 0 and not self._udp.buf and seq != 0:
-            # 这一轮的起点：第一包就不是 0 说明前面真丢了，别为它永久等待。
+        if self._udp_turn != turn_id:
+            # seq 是"本 turn 内从 0 起"（协议 §5.5），所以每轮必须重置基准。
+            # 不重置的话 expected 会停在上轮的末尾值，新一轮 0..N 全部被判成
+            # 重复块丢掉：实测上一轮 272 块时，下一轮 306 块里 272 块记 dups，
+            # 只剩 34 块解码成 0.68 s，ASR 于是只听到一个 "Yeah."。
             self._udp.reset(seq)
+            self._udp_turn = turn_id
+            self.udp_blocks = 0
         for item in self._udp.push(seq, payload):
             self.udp_blocks += 1
             self.on_uplink_adpcm(turn_id, item)
@@ -599,7 +605,8 @@ class Session:
         if self._udp_used:
             log.info("%s udp turn=%d blocks=%d %s tail=%d", self.device_id,
                      turn_id, self.udp_blocks, self._udp.stats(), len(rest))
-        self._udp.reset(self._udp.expected)
+        self._udp.reset(0)
+        self._udp_turn = None
 
     def on_uplink_adpcm(self, turn_id: int, payload: bytes) -> None:
         """kind=5：payload = [u32 seq][164 B IMA 块]。

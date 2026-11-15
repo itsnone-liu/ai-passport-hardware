@@ -111,3 +111,71 @@ def test_hello_mac_is_longer_than_audio():
     """打洞包更值钱：8 字节，伪造一次 2^64；音频块 4 字节换 2% 带宽。"""
     assert audio_udp.mac_len_for(audio_udp.KIND_HELLO) == 8
     assert audio_udp.mac_len_for(audio_udp.KIND_ADPCM) == 4
+
+
+def test_reorder_resets_between_turns():
+    """seq is per-turn from 0; carrying `expected` across turns eats the next turn.
+
+    Measured on the device: turn N sent 272 blocks, turn N+1 sent 306 and 272 of
+    them were counted as duplicates, leaving 34 blocks (0.68 s) for ASR -- which
+    is why anything after the first turn sounded clipped or came back as "Yeah".
+    """
+    r = audio_udp.Reorder()
+    for seq in range(272):                    # turn 1: full
+        assert r.push(seq, b"a") == [b"a"]
+    # turn 2 starts again at seq 0 -- a fresh window, not a continuation
+    r.reset(0)
+    got = []
+    for seq in range(306):
+        got += r.push(seq, b"b")
+    assert len(got) == 306, f"turn 2 must not be eaten as duplicates (got {len(got)})"
+    assert r.dups == 0
+
+
+# ---------------------------------------------------------------------------
+# unittest 包装层：本文件原先是 pytest 风格（裸函数 + @pytest.mark.parametrize），
+# 而 CI/本地跑的是 `unittest discover`，于是这 12 个用例**一个都没执行过**。
+# 保留原函数不动，这里逐条调用，参数化那条按用例展开。
+# ---------------------------------------------------------------------------
+import unittest
+
+
+class TestAudioUdp(unittest.TestCase):
+    def test_build_parse_roundtrip(self):
+        test_build_parse_roundtrip()
+
+    def test_header_is_the_tcp_header(self):
+        test_header_is_the_tcp_header()
+
+    def test_bad_datagrams_raise(self):
+        for bad in (b"", b"PAV", b"XAV1" + bytes(12),
+                    audio_udp.HDR.pack(b"PAV1", 5, 0, 0, 1, 999) + b"short"):
+            with self.assertRaises(audio_udp.BadDatagram):
+                audio_udp.parse(bad)
+
+    def test_in_order_passes_through(self):
+        test_in_order_passes_through()
+
+    def test_one_swap_is_reordered_not_lost(self):
+        test_one_swap_is_reordered_not_lost()
+
+    def test_duplicate_is_dropped(self):
+        test_duplicate_is_dropped()
+
+    def test_hole_smaller_than_hold_waits(self):
+        test_hole_smaller_than_hold_waits()
+
+    def test_hole_bigger_than_hold_gives_up(self):
+        test_hole_bigger_than_hold_gives_up()
+
+    def test_flush_keeps_order(self):
+        test_flush_keeps_order()
+
+    def test_mac_roundtrip_and_tamper(self):
+        test_mac_roundtrip_and_tamper()
+
+    def test_hello_mac_is_longer_than_audio(self):
+        test_hello_mac_is_longer_than_audio()
+
+    def test_reorder_resets_between_turns(self):
+        test_reorder_resets_between_turns()
