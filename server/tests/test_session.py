@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+from types import SimpleNamespace
 import json
 import os
 import sys
@@ -810,5 +811,42 @@ class TestTruncation(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("本来也该被丢弃", spoken)
         self.assertLess(elapsed, 3.0,
                         "the turn waited for the rest of the answer instead of ending")
+        await dev.close()
+        await svc.stop()
+
+
+class TestLongTask(unittest.IsolatedAsyncioTestCase):
+    """A slow agent must not look like a frozen assistant.
+
+    Measured: first text at +108 s while the device had already underrun, so the
+    user heard nothing at all. Now, past `long_task_after`, the device says
+    "这个要查一会儿，我查到就告诉你", the turn ends, and the answer arrives later
+    as its own spoken notification.
+    """
+
+    async def test_slow_brain_gets_announced_then_delivered(self):
+        slow_brain = SimpleNamespace()
+
+        async def ask(text, session="passport"):
+            await asyncio.sleep(1.5)
+            yield "查到了，答案是 42。"
+
+        slow_brain.name = "slow"
+        slow_brain.ask = ask
+        svc = await make_service(long_task_after=0.4, hold_max_seconds=5.0,
+                                 hold_reminder_seconds=100.0, ack_enabled=True,
+                                 ack_text="嗯。")
+        svc.brain = slow_brain
+        await asyncio.sleep(0.2)          # let the canned lines finish synthesising
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        await dev.converse(tone(0.2, 220))
+        spoken = _spoken(svc)
+        self.assertIn("查一会儿", spoken, f"handoff line missing: {spoken!r}")
+        # the promise is kept: the late answer is spoken as a notification turn
+        await asyncio.sleep(2.5)
+        texts = [m.text for s in svc.sessions.values() for m in s.metrics]
+        self.assertTrue(any("42" in t for t in texts),
+                        f"late answer never delivered: {texts}")
         await dev.close()
         await svc.stop()

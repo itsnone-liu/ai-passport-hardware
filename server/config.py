@@ -105,6 +105,11 @@ class Config:
     #: speaker silent (silence keeps the device alive but tells the user nothing).
     hold_reminder_seconds: float = 15.0
     hold_reminder_text: str = "还在查，稍等。"
+    #: If the agent has not produced a single word by this many seconds, stop
+    #: holding the line: say so, end the turn, and deliver the answer when it
+    #: finally exists. Holding for minutes reads as a frozen assistant.
+    long_task_after: float = 25.0
+    long_task_text: str = "这个要查一会儿，我查到就告诉你。"
     #: Send playback.stop + state.set idle right after a device authenticates.
     #: Newer than the firmware in the field: it has not been shown to be safe on
     #: real hardware yet, so it is off until the device proves it tolerates it.

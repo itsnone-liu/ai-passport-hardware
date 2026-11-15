@@ -66,6 +66,7 @@ def tune_socket(writer: asyncio.StreamWriter) -> None:
 # 太小 → 请求次数多、每次都吃固定开销，播放端 starving；
 # 太大 → 首句出声变慢。48 字约等于 4~6 秒音频。
 ACK_NOTE = "（ack）"
+LONG_TASK_NOTE = "（long-task）"
 TTS_FLUSH_CHARS = 48
 TTS_SENTENCE_END = "。！？!?…；;\n"
 
@@ -933,6 +934,38 @@ class Session:
         finally:
             m.done_ms = self.service.now_ms()
 
+    async def _deliver_late(self, turn_id: int, brain_q, pump_done, m: TurnMetrics) -> None:
+        """Deliver an answer that arrived after the turn was handed off.
+
+        The user was told "我查到就告诉你", so the promise has to be kept: when the
+        agent finally writes, speak it as a notification (its own turn) if the
+        device is idle, otherwise put it on the screen.
+        """
+        parts: list[str] = []
+        while True:
+            item = await brain_q.get()
+            if item is pump_done:
+                break
+            if isinstance(item, Exception):
+                log.warning("%s late answer failed: %s", self.device_id, item)
+                break
+            if item:
+                parts.append(item)
+        text = "".join(parts).strip()
+        if not text:
+            log.info("%s late answer was empty for turn %d", self.device_id, turn_id)
+            return
+        m.overflow = text
+        log.info("%s late answer for turn %d: %d chars", self.device_id, turn_id, len(text))
+        try:
+            if self.state == STATE_IDLE:
+                await self.speak_notification(text)
+            else:
+                with contextlib.suppress(Exception):
+                    await self.control.request("show_text", 2.0, text=text[:400])
+        except Exception:                              # noqa: BLE001
+            log.exception("late delivery failed")
+
     async def _speak(self, turn_id: int, m: TurnMetrics) -> None:
         """Stream a reply: start synthesising first, announce playback second.
 
@@ -981,11 +1014,48 @@ class Session:
                     # The gap between "user stopped talking" and "first agent
                     # text" measured 12 s; the ack is pre-synthesised, so the
                     # device starts speaking without waiting for the model.
-                    said.append(ACK_NOTE)
+                    said.append(self.cfg.ack_text)   # metrics say what was heard
                     await queue.put(ack)
                 log.info("%s speak: asking brain for turn %d", self.device_id, turn_id)
-                async for chunk in self.service.brain.ask(m.text,
-                                                          session=self.service.dsh_session):
+                agen = self.service.brain.ask(m.text, session=self.service.dsh_session)
+                brain_q: asyncio.Queue = asyncio.Queue()
+                pump_done = object()
+
+                async def pump() -> None:
+                    # The generator must keep running across our timeouts: waiting
+                    # on __anext__ with wait_for() cancels it, and a cancelled
+                    # async generator cannot be resumed -- the late answer would
+                    # be lost exactly when the handoff needs it.
+                    try:
+                        async for piece in agen:
+                            await brain_q.put(piece)
+                    except Exception as exc:           # noqa: BLE001
+                        await brain_q.put(exc)
+                    finally:
+                        await brain_q.put(pump_done)
+
+                pump_task = asyncio.create_task(pump())
+                started = time.monotonic()
+                handed_off = False
+                while True:
+                    wait = None
+                    if m.dsh_first_ms is None and self.cfg.long_task_after > 0:
+                        left = self.cfg.long_task_after - (time.monotonic() - started)
+                        if left <= 0:
+                            # Nothing to say yet and the user has been waiting in
+                            # silence: say what is going on, close the turn, and
+                            # deliver the answer when it exists.
+                            handed_off = True
+                            break
+                        wait = left
+                    try:
+                        chunk = await asyncio.wait_for(brain_q.get(), timeout=wait)
+                    except asyncio.TimeoutError:
+                        continue
+                    if chunk is pump_done:
+                        break
+                    if isinstance(chunk, Exception):
+                        raise chunk
                     if m.dsh_first_ms is None:
                         m.dsh_first_ms = self.service.now_ms()
                         first_text.set()
@@ -1011,7 +1081,24 @@ class Session:
                         log.info("%s turn %d speech budget exhausted; ending stream",
                                  self.device_id, turn_id)
                         break
-                if buf.strip():
+                if handed_off:
+                    log.info("%s turn %d handed off to a background answer "
+                             "(no text after %.0fs)", self.device_id, turn_id,
+                             self.cfg.long_task_after)
+                    said.append(self.cfg.long_task_text)
+                    if self.service.long_task_pcm:
+                        await queue.put(self.service.long_task_pcm)
+                    else:
+                        # Not synthesised yet (startup race): do it now rather
+                        # than hand off in silence -- the whole point is to say
+                        # something before disappearing.
+                        with contextlib.suppress(Exception):
+                            async for audio in self.service.tts.stream(
+                                    self.cfg.long_task_text):
+                                await queue.put(audio)
+                    asyncio.create_task(self._deliver_late(turn_id, brain_q,
+                                                           pump_done, m))
+                elif buf.strip():
                     await flush(buf)
                 if budget.truncated:
                     note = budget.tail_note()
@@ -1508,6 +1595,7 @@ class Service:
             asyncio.create_task(self._prepare_ack())
         if self.cfg.hold_reminder_text:
             asyncio.create_task(self._prepare_wait())
+        self.long_task_pcm = b""
         if self.cfg.audio_revive_after > 0:
             self._revive_task = asyncio.create_task(self._audio_revive_loop())
         log.info("control on %s:%d audio on %s:%d", self.cfg.host, self.control_port,
@@ -1542,6 +1630,13 @@ class Service:
         except Exception:                                  # noqa: BLE001
             log.warning("wait-line synthesis failed; holds will be silent")
             self.wait_pcm = b""
+        try:
+            chunks = [c async for c in self.tts.stream(self.cfg.long_task_text)]
+            self.long_task_pcm = b"".join(chunks)
+            log.info("long-task line ready: %d bytes for %r",
+                     len(self.long_task_pcm), self.cfg.long_task_text)
+        except Exception:                                  # noqa: BLE001
+            log.warning("long-task line synthesis failed; long turns will be silent")
 
     async def _audio_revive_loop(self) -> None:
         """Nudge the device to re-dial its audio channel after a silent drop.
