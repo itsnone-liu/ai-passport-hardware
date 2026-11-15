@@ -988,11 +988,24 @@ class Session:
         producer = asyncio.create_task(produce())
         try:
             first = await queue.get()
-            log.info("%s speak: first audio chunk %d B", self.device_id,
-                     len(first) if not isinstance(first, Exception) else -1)
+            # The sentinel is a plain object(); asking len() of it crashed the
+            # whole turn after the brain produced nothing (measured: screen had
+            # the transcript, speaker stayed silent).
+            log.info("%s speak: first audio chunk %s", self.device_id,
+                     "SENTINEL" if first is producer_done
+                     else (f"{len(first)} B" if not isinstance(first, Exception)
+                           else f"EXC {first}"))
             if isinstance(first, Exception):
                 raise first
             if first is producer_done:
+                # The brain closed without a single sentence (measured: an ask
+                # that steers a running turn, on bridge code from before the
+                # skip-first-end fix, answers with an empty done). Returning
+                # here without settling the state left the device stuck in
+                # `speaking` forever -- the screen never went back to idle.
+                log.warning("%s brain produced nothing for turn %d; settling to idle",
+                            self.device_id, turn_id)
+                await self._to_idle(turn_id)
                 return
             # 每轮从 seq=0、编码器初值、FEC 组空开始。跨轮沿用会让一个奇偶组
             # 横跨两轮，恢复出来的块会挂到错误的 turn 上；ADPCM 预测器跨轮
@@ -1404,10 +1417,53 @@ class Service:
         if self.cfg.admin_port:
             self._servers.append(await asyncio.start_server(
                 self._on_admin, "127.0.0.1", self.cfg.admin_port))
+        if self.cfg.audio_revive_after > 0:
+            self._revive_task = asyncio.create_task(self._audio_revive_loop())
         log.info("control on %s:%d audio on %s:%d", self.cfg.host, self.control_port,
                  self.cfg.host, self.audio_port)
 
+    async def _audio_revive_loop(self) -> None:
+        """Nudge the device to re-dial its audio channel after a silent drop.
+
+        Observed twice in one day: Wi-Fi vanishes without FIN, the control
+        channel comes back on its own, the audio channel does not, and every
+        turn then fails with `not_supported` until somebody sends
+        vendor.audio_reconnect by hand. The device cannot detect this itself --
+        it thinks the socket is alive -- so the server has to notice.
+        """
+        # Poll faster than the revive threshold so the nudge lands close to it
+        # (2 s in production; sub-second when the threshold is short in tests).
+        interval = max(0.2, min(2.0, self.cfg.audio_revive_after / 2))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                missing_since: Dict[str, float] = getattr(self, "_audio_missing_since", {})
+                self._audio_missing_since = missing_since
+                now = time.monotonic()
+                for device_id, session in list(self.sessions.items()):
+                    has_audio = bool(session.audio and session.audio.authed)
+                    if has_audio or not session.authed:
+                        missing_since.pop(device_id, None)
+                        continue
+                    first = missing_since.setdefault(device_id, now)
+                    if now - first < self.cfg.audio_revive_after:
+                        continue
+                    missing_since[device_id] = now          # rate-limit to one nudge/window
+                    if session.state not in (STATE_IDLE,):
+                        continue                            # never disturb a turn
+                    log.warning("%s audio channel missing for %.0fs; nudging reconnect",
+                                device_id, self.cfg.audio_revive_after)
+                    with contextlib.suppress(Exception):
+                        await session.control.request("vendor.audio_reconnect", 5.0)
+            except asyncio.CancelledError:
+                return
+            except Exception:                               # noqa: BLE001
+                log.exception("audio revive loop error (contained)")
+
     async def stop(self) -> None:
+        task = getattr(self, "_revive_task", None)
+        if task:
+            task.cancel()
         for srv in self._servers:
             srv.close()
             with contextlib.suppress(Exception):

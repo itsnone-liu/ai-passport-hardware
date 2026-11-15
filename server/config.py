@@ -83,6 +83,12 @@ class Config:
     # sessions get no audio and are logged loudly. Never enable on a public host.
     allow_anonymous: bool = False
 
+    # The device's audio channel does not redial by itself after a silent Wi-Fi
+    # drop (the control channel does). Measured twice today: manual
+    # vendor.audio_reconnect was needed both times. Seconds to wait before the
+    # server nudges the device; 0 disables the watchdog.
+    audio_revive_after: float = 6.0
+
     # Dev-only: count PAV1 PCM frames that do not belong to a turn, so firmware
     # can prove frame boundaries end to end (vendor.uplink_test) before
     # capture.start exists. Counted, never played, never fed to ASR.

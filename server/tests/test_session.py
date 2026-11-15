@@ -9,6 +9,7 @@ free; a separate opt-in test hits Bailian for real.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -702,3 +703,37 @@ class TestCaptureSignals(ServiceCase):
                            "a single busy must not abandon the turn")
         session = self.svc.session_of(DEVICE)
         self.assertEqual(1, len(session.metrics))
+
+
+class TestAudioRevive(unittest.IsolatedAsyncioTestCase):
+    """A silent Wi-Fi drop leaves the audio channel dead while control survives.
+
+    Seen twice in one day: manual `vendor.audio_reconnect` was needed both times.
+    The device cannot notice (its socket looks alive), so the server nudges.
+    """
+
+    async def test_watchdog_nudges_once_when_audio_is_missing(self):
+        svc = await make_service(audio_revive_after=0.3)
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        session = svc.session_of(DEVICE)
+        # simulate the device's audio socket vanishing while control stays up
+        with contextlib.suppress(Exception):
+            session.audio.writer.close()
+        await asyncio.sleep(0.1)
+        session.audio = None
+        await asyncio.sleep(1.2)
+        cmds = [c["cmd"] for c in dev.commands]
+        self.assertIn("vendor.audio_reconnect", cmds,
+                      f"server never nudged the device: {cmds}")
+        await dev.close()
+        await svc.stop()
+
+    async def test_no_nudge_while_audio_is_healthy(self):
+        svc = await make_service(audio_revive_after=0.3)
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        await asyncio.sleep(1.0)
+        self.assertNotIn("vendor.audio_reconnect", [c["cmd"] for c in dev.commands])
+        await dev.close()
+        await svc.stop()
