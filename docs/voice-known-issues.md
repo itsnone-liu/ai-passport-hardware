@@ -52,6 +52,20 @@
 | 19 | 语音触发的写操作审批 | 会弹飞书卡片，开车场景无法点 |
 | 20 | 长时间挂机（>1 天）后设备重连 | 今天多次断连都靠手动/重启恢复 |
 
+## 五之二、额度口径（易错）
+
+语音链路的三件事**全部走百炼 token-plan 订阅**，不走向量计费 API：
+
+| 环节 | 端点 |
+|---|---|
+| ASR | `wss://token-plan.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen-audio-3.0-realtime-plus` |
+| TTS | `POST …/api/v1/services/audio/tts/SpeechSynthesizer`（SSE，16 kHz s16） |
+| 回复 | 桥里的 dsh 会话（模型由桥配置决定） |
+
+**订阅额度是「月额度」，不是滚动窗口**（2026-11-15 用户纠正）。
+含义：语音对话与其它使用共享当月总量，长时间连续对话会实打实吃掉月度额度，
+不会"过几小时自动恢复"。额度耗尽时应视为需要等月度重置，不要当成 key 失效。
+
 ## 六、测试与工具现状
 
 - `ai-passport-hardware`：**106 个 Python 测试**全绿（约 18 s），`feat/passport-voice-ubuntu`；
