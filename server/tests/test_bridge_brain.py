@@ -44,6 +44,25 @@ class FakeBridge:
             await self._server.wait_closed()
 
     async def _handle(self, reader, writer):
+        # Reading and writing run independently: a real bridge keeps reading
+        # while it streams, so a `cancel` arriving mid-stream is never lost. A
+        # single loop here made the barge-in look broken (the write raised first).
+        writing = asyncio.Event()
+
+        async def stream(ask_id):
+            try:
+                for item in self.script:
+                    if item.get("wait"):
+                        await asyncio.sleep(item["wait"])
+                        continue
+                    writer.write((json.dumps({**item, "id": ask_id},
+                                             ensure_ascii=False) + "\n").encode())
+                    await writer.drain()
+            except (ConnectionResetError, BrokenPipeError):
+                return
+            finally:
+                writing.set()
+
         try:
             while True:
                 line = await reader.readline()
@@ -54,13 +73,8 @@ class FakeBridge:
                 if msg.get("op") == "ask":
                     writer.write((json.dumps({"type": "ack", "id": msg["id"]}) + "\n").encode())
                     await writer.drain()
-                    for item in self.script:
-                        if item.get("wait"):
-                            await asyncio.sleep(item["wait"])
-                            continue
-                        writer.write((json.dumps({**item, "id": msg["id"]},
-                                                 ensure_ascii=False) + "\n").encode())
-                        await writer.drain()
+                    writing.clear()
+                    asyncio.create_task(stream(msg["id"]))
         except (ConnectionResetError, BrokenPipeError):
             return
         finally:
@@ -108,6 +122,38 @@ class TestBridgeBrain(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("今天天气怎么样", self.fake.received[0]["text"])
         self.assertEqual("ask", self.fake.received[0]["op"])
 
+    async def test_process_talk_is_skipped_and_only_the_conclusion_is_spoken(self):
+        """Intermediate steps must not eat the budget the answer needs."""
+        self.fake.script = [
+            {"type": "step"},
+            {"type": "delta", "text": "我先去查一下汤圆的磁盘情况，"},
+            {"type": "delta", "text": "可能要几秒钟。"},
+            {"type": "step"},
+            {"type": "delta", "text": "汤圆还剩四十九个 G，"},
+            {"type": "delta", "text": "比米线宽裕。"},
+            {"type": "done", "cancelled": False},
+        ]
+        got = [s async for s in self.brain.astream("汤圆磁盘")]
+        text = "".join(got)
+        self.assertIn("四十九个 G", text)
+        self.assertNotIn("我先去查一下", text,
+                         f"process talk was spoken: {text!r}")
+
+    async def test_a_short_progress_line_is_spoken_immediately(self):
+        """A one-line "我看一下" is worth saying right away; it is not the answer."""
+        self.fake.script = [
+            {"type": "step"},
+            {"type": "delta", "text": "我看一下。"},
+            {"type": "step"},
+            {"type": "delta", "text": "还剩四十九个 G。"},
+            {"type": "done", "cancelled": False},
+        ]
+        stream = self.brain.astream("汤圆磁盘")
+        first = await stream.__anext__()
+        self.assertIn("我看一下", first)
+        rest = [x async for x in stream]
+        self.assertIn("四十九", "".join(rest))
+
     async def test_tail_without_terminator_is_still_spoken(self):
         self.fake.script = [
             {"type": "delta", "text": "我查到了"},
@@ -117,16 +163,21 @@ class TestBridgeBrain(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["我查到了"], got)
 
     async def test_barge_in_sends_cancel_to_the_bridge(self):
+        # A short progress step is what the device is speaking when a barge-in
+        # arrives; the long conclusion is still being written.
         self.fake.script = [
-            {"type": "delta", "text": "这是一段很长的话，"},
+            {"type": "step"},
+            {"type": "delta", "text": "我看一下。"},
+            {"type": "step"},
+            {"type": "delta", "text": "这是一段很长的结论，"},
             {"wait": 0.05},
-            {"type": "delta", "text": "还没说完"},
+            {"type": "delta", "text": "还没写完"},
             {"type": "delta", "text": "。"},
             {"type": "done", "cancelled": False},
         ]
         stream = self.brain.astream("讲个故事")
         first = await stream.__anext__()
-        self.assertIn("很长的话", first)
+        self.assertIn("我看一下", first)
         await stream.aclose()                     # what a barge-in looks like
         await asyncio.sleep(0.15)
         ops = [m.get("op") for m in self.fake.received]

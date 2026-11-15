@@ -68,7 +68,7 @@ class BridgeBrain:
 
     def __init__(self, socket_path: str, *, timeout: float = 180.0,
                  first_event_timeout: float = 60.0, connect_retries: int = 2,
-                 connect_retry_delay: float = 0.5):
+                 connect_retry_delay: float = 0.5, short_step_chars: int = 15):
         if not socket_path:
             raise ValueError("bridge brain needs a socket path")
         self.socket_path = socket_path
@@ -78,6 +78,10 @@ class BridgeBrain:
         self.connect_retry_delay = connect_retry_delay
         self._seq = 0
         self.last_latency_ms: Optional[int] = None
+        #: A step's text shorter than this is progress talk ("我看一下") and is
+        #: spoken at once; anything longer is content, kept for the conclusion
+        #: so that commentary cannot spend the answer's budget.
+        self.short_step_chars = short_step_chars
 
     # -- connection --------------------------------------------------------
     async def _connect(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -103,6 +107,8 @@ class BridgeBrain:
         rid = self._seq
         started = time.monotonic()
         buf = ""
+        step_buf = ""
+        spent_short_line = False
         first_seen = False
         finished = False
 
@@ -130,15 +136,29 @@ class BridgeBrain:
                 except json.JSONDecodeError:
                     continue
                 kind = msg.get("type")
+                if kind == "step":
+                    # A new agent step began: decide what the previous one was.
+                    # Short steps are progress talk ("我看一下") and go out at
+                    # once; anything longer is the answer itself, kept for the
+                    # end so that process commentary cannot eat the budget that
+                    # the conclusion needs.
+                    text = step_buf.strip()
+                    step_buf = ""
+                    if text and not spent_short_line and len(text) <= self.short_step_chars:
+                        spent_short_line = True
+                        for piece in split_sentences(text + "。" )[0]:
+                            yield piece
+                    continue
                 if kind == "delta":
-                    buf += str(msg.get("text") or "")
-                    sentences, buf = split_sentences(buf)
-                    for s in sentences:
-                        yield s
+                    step_buf += str(msg.get("text") or "")
                 elif kind == "done":
                     finished = True
-                    if buf.strip():
-                        yield buf.strip()
+                    final_text = step_buf.strip()
+                    sentences, rest = split_sentences(final_text)
+                    for piece in sentences:
+                        yield piece
+                    if rest.strip():
+                        yield rest.strip()
                     self.last_latency_ms = int((time.monotonic() - started) * 1000)
                     return
                 elif kind == "error":
