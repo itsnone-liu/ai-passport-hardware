@@ -20,7 +20,16 @@ SERVER = os.path.dirname(HERE)
 sys.path.insert(0, os.path.dirname(SERVER))
 
 from server.config import Config               # noqa: E402
-from server.mock_device import MockPassport    # noqa: E402
+from server.mock_device import MockPassport
+
+
+def _spoken(svc) -> str:
+    """Text the service decided to read aloud, from its own metrics."""
+    out = []
+    for session in svc.sessions.values():
+        for m in session.metrics:
+            out.append(getattr(m, "spoken", "") or "")
+    return "".join(out)    # noqa: E402
 from server.service import Service, STATE_IDLE  # noqa: E402
 from server.asr.mock import MockASR            # noqa: E402
 from server.tts.mock import MockTTS, tone      # noqa: E402
@@ -735,5 +744,36 @@ class TestAudioRevive(unittest.IsolatedAsyncioTestCase):
         await dev.connect()
         await asyncio.sleep(1.0)
         self.assertNotIn("vendor.audio_reconnect", [c["cmd"] for c in dev.commands])
+        await dev.close()
+        await svc.stop()
+
+
+class TestSilenceHold(unittest.IsolatedAsyncioTestCase):
+    """The ack cannot bridge a slow brain by itself.
+
+    Measured on the device: ack 1.6 s, then `audio_underrun` at +2.5 s, and the
+    real answer arrived 64 s later -- to a playback that had already ended, so it
+    was shown on screen but never spoken. Silence frames hold the turn open.
+    """
+
+    async def test_playback_stays_open_while_the_brain_is_slow(self):
+        class SlowBrain:
+            name = "slow"
+
+            async def ask(self, text, session="passport"):
+                await asyncio.sleep(1.2)          # longer than the 500 ms underrun window
+                yield "答案来了。"
+
+        svc = await make_service(ack_enabled=True, ack_text="嗯。", hold_max_seconds=5.0)
+        svc.brain = SlowBrain()
+        dev = MockPassport("127.0.0.1", svc.control_port, DEVICE, SECRET)
+        await dev.connect()
+        # the session must survive the slow brain and actually play the answer
+        await dev.converse(tone(0.2, 220))
+        played = len(dev.playback)          # bytes the device accepted into its ring
+        self.assertGreater(played, 0, "no audio was played at all")
+        self.assertIn("答案来了", _spoken(svc), "the slow answer never reached the speaker")
+        self.assertEqual(dev.underruns, 0,
+                         "playback died while the brain was still working")
         await dev.close()
         await svc.stop()

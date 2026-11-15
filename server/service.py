@@ -985,6 +985,7 @@ class Session:
                                                           session=self.service.dsh_session):
                     if m.dsh_first_ms is None:
                         m.dsh_first_ms = self.service.now_ms()
+                        first_text.set()
                         log.info("%s speak: first text chunk at +%d ms", self.device_id,
                                  m.dsh_first_ms - m.speech_end_ms)
                     if not chunk:
@@ -1018,6 +1019,27 @@ class Session:
             finally:
                 await queue.put(producer_done)
 
+        # Keep the speaker alive while the brain is still working: the device
+        # ends playback after 500 ms of silence, and the measured gap between
+        # the ack and the first real sentence was 64 s (the agent was running
+        # tools). Silence frames are valid PCM, so the device simply keeps
+        # "playing" nothing instead of closing the turn.
+        first_text = asyncio.Event()
+
+        async def hold_open() -> None:
+            silence = b"\x00" * 640                     # one 20 ms frame
+            deadline = time.monotonic() + self.cfg.hold_max_seconds
+            while not first_text.is_set() and not self._cancel.is_set():
+                if time.monotonic() >= deadline:
+                    log.warning("%s hold expired after %.0fs with no text; "
+                                "the answer will land on screen only",
+                                self.device_id, self.cfg.hold_max_seconds)
+                    return
+                await queue.put(silence)
+                await asyncio.sleep(0.02)               # paces two frames/40 ms
+
+        hold_task = (asyncio.create_task(hold_open())
+                     if self.service.ack_pcm and self.cfg.hold_max_seconds > 0 else None)
         producer = asyncio.create_task(produce())
         try:
             first = await queue.get()
@@ -1072,6 +1094,8 @@ class Session:
             m.cancelled = self._last_end_reason == "cancelled"
             await self._to_idle(turn_id)
         finally:
+            if hold_task:
+                hold_task.cancel()
             if not producer.done():
                 producer.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

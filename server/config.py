@@ -97,6 +97,10 @@ class Config:
     ack_text: str = "嗯，我看一下。"
     #: The device reports this much audio already played when ack is on.
     ack_enabled: bool = True
+    #: How long silence may be streamed to keep playback open while the agent
+    #: is still working. The device ends playback after 500 ms of no data
+    #: (audio_underrun), so a 1.6 s ack cannot bridge a 60 s think.
+    hold_max_seconds: float = 20.0
 
     # Dev-only: count PAV1 PCM frames that do not belong to a turn, so firmware
     # can prove frame boundaries end to end (vendor.uplink_test) before

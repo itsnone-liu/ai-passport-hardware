@@ -333,8 +333,26 @@ class MockPassport:
             if obj.get("ok") is False:
                 self.errors.append({"event": "error", "code": obj.get("err", "hello_failed")})
         elif frame.kind == pav1.KIND_PCM:
+            # Real firmware ends playback after 500 ms without data
+            # (`audio_underrun`). Modelling it here is what makes the silence
+            # hold test meaningful -- without it the mock happily accepts an
+            # answer that the device would have discarded.
+            now = time.monotonic()
+            if self.t_first_pcm and now - self.t_first_pcm > 0.5 and self._last_pcm_at:
+                if now - self._last_pcm_at > 0.5:
+                    self.underruns += 1
+                    self.playback_closed = True
+                    await self._emit({"event": "error", "turn_id": self.turn_id,
+                                      "code": "audio_underrun"})
+                    await self._emit({"event": "playback.ended", "turn_id": self.turn_id,
+                                      "reason": "underrun"})
+                    self._playback_ended.set()
+                    return
+            if getattr(self, "playback_closed", False):
+                return                      # frames after the underrun are dropped
+            self._last_pcm_at = now
             if not self.t_first_pcm:
-                self.t_first_pcm = time.monotonic()
+                self.t_first_pcm = now
             self.playback += frame.payload
             if frame.turn_id not in self.playback_turns:
                 self.playback_turns.append(frame.turn_id)
