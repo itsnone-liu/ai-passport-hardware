@@ -69,6 +69,46 @@ ACK_NOTE = "（ack）"
 LONG_TASK_NOTE = "（long-task）"
 TTS_FLUSH_CHARS = 48
 TTS_SENTENCE_END = "。！？!?…；;\n"
+#: 48 字预算用尽时的"软切点"：宁可早一点/晚一点，也不切在词中间。
+SOFT_BREAKS = "，、：,;: \t\n"
+
+
+#: 逐帧静音判定阈值（16-bit 峰值）。语音帧峰值通常 >2000，底噪 <50。
+SILENCE_PEAK = 200
+#: 一段之内最多放行这么多帧静音（每帧 20 ms）：5 帧 = 100 ms 的自然句内停顿。
+MAX_SILENT_FRAMES = 5
+
+
+def frame_peak(pcm16: bytes) -> int:
+    """Peak absolute sample of one 16-bit little-endian PCM frame."""
+    peak = 0
+    for i in range(0, len(pcm16) - 1, 2):
+        v = pcm16[i] | (pcm16[i + 1] << 8)
+        if v >= 32768:
+            v -= 65536
+        if v < 0:
+            v = -v
+        if v > peak:
+            peak = v
+    return peak
+
+
+def split_at_soft_break(text: str, min_keep: int = TTS_FLUSH_CHARS // 2) -> tuple:
+    """Split `text` at the last punctuation/space, not wherever 48 chars lands.
+
+    硬切会把"请耐心听完"切成"请耐"+"心听完"，两段各自独立合成时，前半段
+    末尾的"耐"和后半段开头的"心"都读不完整 —— 听感就是"有的字吐不出来"。
+    返回 (可送去合成的部分, 留在缓冲区等下一块的剩余)。
+    整段没有可用切点时原样返回 (text, "")，行为与修复前一致。
+    """
+    cut = -1
+    for i in range(len(text) - 1, min_keep - 1, -1):
+        if text[i] in SOFT_BREAKS:
+            cut = i
+            break
+    if cut < min_keep:
+        return text, ""
+    return text[:cut + 1], text[cut + 1:]
 
 class ProtocolViolation(Exception):
     def __init__(self, code: str, detail: str = "", fatal: bool = True):
@@ -1013,10 +1053,26 @@ class Session:
                 if not speakable.strip():
                     return
                 said.append(speakable)
+                # 逐帧静音门限：TTS 每段自带 0.3 s 起音静音和多达 1.3 s 的收尾
+                # 静音，分段拼接后就是句间的长空白（听感＝"字吐不出来"）。
+                # 门限只放行 <=100 ms 的静音（句内自然停顿），更长的整段丢掉；
+                # 仍是逐帧流式入队，不牺牲第一声的延迟。
+                hold = b""
+                silent_frames = 0
                 async for audio in self.service.tts.stream(speakable):
                     if self._cancel.is_set():
                         return
-                    await queue.put(audio)
+                    hold += audio
+                    while len(hold) >= pav1.FRAME_BYTES_20MS:
+                        frame, hold = hold[:pav1.FRAME_BYTES_20MS], hold[pav1.FRAME_BYTES_20MS:]
+                        if frame_peak(frame) > SILENCE_PEAK:
+                            silent_frames = 0
+                            await queue.put(frame)
+                        else:
+                            silent_frames += 1
+                            if silent_frames <= MAX_SILENT_FRAMES:
+                                await queue.put(frame)
+                # 不足一帧的尾巴丢给下一段，避免半个帧
 
             try:
                 ack = self.service.ack_pcm
@@ -1032,6 +1088,10 @@ class Session:
                     # *reply* to the announcement instead of the announcement.
                     log.info("%s speak: verbatim notification for turn %d (%d chars)",
                              self.device_id, turn_id, len(m.text or ""))
+                    # 关键：verbatim 不走下面那个收 chunk 的循环，所以历史上
+                    # 从来不会 set first_text —— hold_open 于是一路往队列里塞
+                    # 640 B 静音帧，与真正的语音交错，听感就是"有的字吐不出来"。
+                    first_text.set()
                     await flush(m.text or "")
                     if buf.strip():
                         await flush(buf)
@@ -1092,7 +1152,10 @@ class Session:
                     last = buf.rstrip()[-1:]
                     if len(buf) < TTS_FLUSH_CHARS and last not in TTS_SENTENCE_END:
                         continue
-                    text, buf = buf, ""
+                    if len(buf) >= TTS_FLUSH_CHARS and last not in TTS_SENTENCE_END:
+                        text, buf = split_at_soft_break(buf)
+                    else:
+                        text, buf = buf, ""
                     await flush(text)
                     if self._cancel.is_set():
                         return
@@ -1298,7 +1361,8 @@ class Session:
         lost block costs 20 ms and needs no retransmission -- that is exactly
         what makes UDP usable here.
         """
-        if (self.udp_peer is not None and self.udp_transport is not None
+        if (not self.cfg.force_tcp and self.udp_peer is not None
+                and self.udp_transport is not None
                 and not self.udp_transport.is_closing()):
             blk, self._down_state = adpcm.encode_block(frame, self._down_state)
             # seq 默认顺次分配；显式传入只给台架用——它要让 seq 跟着帧号走，
@@ -1325,6 +1389,24 @@ class Session:
             return
         await self.audio.send_frame(pav1.KIND_PCM, turn_id, frame)
 
+    async def _keepalive_ping(self) -> None:
+        """Keep the idle control channel from tripping the TCP keepalive.
+
+        During playback every byte goes over the audio link; the control channel
+        says nothing for the whole utterance. tune_socket() sets 30 s idle +
+        3 x 10 s probes, so an utterance longer than a minute is closed as
+        "peer dead" mid-sentence. A ping (protocol §6.1, answered with pong)
+        every 25 s keeps the channel provably alive without weakening the
+        detection of a device that really did lose Wi-Fi.
+        """
+        link = self.control
+        if link is None or link.closed:
+            return
+        try:
+            await link.send({"id": self.next_server_id(), "cmd": "ping"})
+        except Exception:  # noqa: BLE001 - a failed ping must not stop playback
+            pass
+
     async def _write_audio(self, audio: bytes, turn_id: int, m: TurnMetrics) -> None:
         """Push 640 B frames, holding a lead of ~400 ms over real time.
 
@@ -1337,6 +1419,27 @@ class Session:
         300 ms prebuffer immediately, jitter is absorbed by the lead, and the
         ring stays at roughly a third of capacity.
         """
+        if self.cfg.dump_pcm_dir:
+            try:
+                import os as _os
+                if getattr(self, "_dump_turn", None) != turn_id:
+                    self._dump_turn = turn_id
+                    _os.makedirs(self.cfg.dump_pcm_dir, exist_ok=True)
+                    self._dump_path = _os.path.join(
+                        self.cfg.dump_pcm_dir,
+                        "turn%d_%d.pcm" % (turn_id, int(asyncio.get_running_loop().time() * 1000)))
+                    log.info("%s pcm dump -> %s", self.device_id, self._dump_path)
+                with open(self._dump_path, "ab") as _f:
+                    _f.write(audio)
+            except Exception:  # noqa: BLE001 - dumping must never break playback
+                log.exception("pcm dump failed")
+        # 播放期间控制通道完全空闲，而 tune_socket() 的 keepalive(30+10*3=60 s)
+        # 会把"安静"判成"对端死亡"：2026-11-19 实测 445 字的一段在 61 s 处被掐断，
+        # 设备随后 6 s 内重连成功（说明它一直活着）。每 25 s 发一次 ping，设备回
+        # pong，控制通道双向都有流量，keepalive 不再误判；设备真掉线时仍按原参数
+        # 在 60 s 内被发现。
+        PING_EVERY_S = 25.0
+        next_ping_t = asyncio.get_running_loop().time() + PING_EVERY_S
         step = pav1.FRAME_BYTES_20MS
         speed = max(0.001, self.cfg.playback_speed)
         if self._pace_t0 is None:
@@ -1345,6 +1448,9 @@ class Session:
         for off in range(0, len(audio), step):
             if self._cancel.is_set():
                 return
+            if asyncio.get_running_loop().time() >= next_ping_t:
+                next_ping_t = asyncio.get_running_loop().time() + PING_EVERY_S
+                await self._keepalive_ping()
             frame = audio[off:off + step]
             if len(frame) < step and off + step > len(audio):
                 break               # partial tail is dropped, not padded into the speaker

@@ -45,6 +45,13 @@ class Config:
     # 收轮时给 UDP 尾巴的等待（秒）。END 从 TCP 来，最后几包 UDP 可能
     # 还在路上；120 ms 是实测抖动上界，再大就会明显拖慢回答。
     udp_tail_ms: float = 120.0
+    #: 诊断开关：True 时下行一律走 TCP/PCM（原始 16-bit, 32 KB/s），
+    #: 绕过 UDP+ADPCM（3.8:1 压缩、20 ms 块、单向 FEC）。用来把
+    #: “UDP 丢包 / ADPCM 音质” 和 “设备播放链路” 两类卡顿原因分开。
+    force_tcp: bool = False
+    #: 诊断：非空时把每轮真正下发到设备的 PCM 原样落盘到这个目录，
+    #: 用来区分"服务端合成/拼接"与"设备播放"两侧的问题。
+    dump_pcm_dir: str = ""
     # device_id -> shared secret (bytes). Never the cardid: that identifies the
     # device to FoloToy, it does not authenticate it to us.
     devices: Dict[str, bytes] = field(default_factory=dict)
